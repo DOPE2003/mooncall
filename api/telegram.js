@@ -1,17 +1,29 @@
-const mongoose = require("mongoose");
+// api/telegram.js
+const { bot, ensureDb } = require("../mooncall");
 
-const SessionSchema = new mongoose.Schema(
-  {
-    userId: { type: String, index: true, unique: true },
-    step: { type: String, default: "idle" },
-    data: { type: Object, default: {} },
-    updatedAt: { type: Date, default: Date.now, index: true },
-  },
-  { minimize: false }
-);
+// Fast-ACK webhook that processes the update after responding.
+// This avoids Vercel timeouts/cold-start lag.
+module.exports = async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      return res.status(200).json({ ok: true, hint: "POST updates here" });
+    }
 
-// TTL: auto-clean after 1 hour of inactivity
-SessionSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 3600 });
+    // Reply immediately so Telegram stops waiting.
+    res.status(200).json({ ok: true });
 
-module.exports =
-  mongoose.models.Session || mongoose.model("Session", SessionSchema);
+    // Do the real work after the ACK:
+    const update = req.body;
+    // make sure DB is available (no-op if already connected)
+    await ensureDb();
+
+    // handle the update without blocking the response
+    setImmediate(() => {
+      bot.handleUpdate(update).catch((e) => console.error("handleUpdate:", e));
+    });
+  } catch (e) {
+    // If anything blew up before we replied:
+    try { res.status(200).json({ ok: true }); } catch (_) {}
+    console.error("telegram endpoint:", e);
+  }
+};
