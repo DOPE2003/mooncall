@@ -1,29 +1,27 @@
 // api/telegram.js
 const { bot, ensureDb } = require("../mooncall");
 
-// Fast-ACK webhook that processes the update after responding.
-// This avoids Vercel timeouts/cold-start lag.
+// IMPORTANT: reply immediately so Vercel doesn't time out.
+// Do the heavy work after we respond.
 module.exports = async (req, res) => {
+  if (req.method !== "POST") {
+    return res.status(200).json({ ok: true, hint: "POST Telegram updates here" });
+  }
+
+  // 1) ACK right away
+  res.status(200).end("OK");
+
+  // 2) Then, process in background (no await on res)
   try {
-    if (req.method !== "POST") {
-      return res.status(200).json({ ok: true, hint: "POST updates here" });
-    }
-
-    // Reply immediately so Telegram stops waiting.
-    res.status(200).json({ ok: true });
-
-    // Do the real work after the ACK:
-    const update = req.body;
-    // make sure DB is available (no-op if already connected)
-    await ensureDb();
-
-    // handle the update without blocking the response
-    setImmediate(() => {
-      bot.handleUpdate(update).catch((e) => console.error("handleUpdate:", e));
-    });
+    await ensureDb();                // cached mongo connect (fast after first time)
   } catch (e) {
-    // If anything blew up before we replied:
-    try { res.status(200).json({ ok: true }); } catch (_) {}
-    console.error("telegram endpoint:", e);
+    console.error("ensureDb failed:", e.message);
+    // still try to process the update so the bot can at least /start
+  }
+
+  try {
+    await bot.handleUpdate(req.body);  // let Telegraf handle it
+  } catch (e) {
+    console.error("handleUpdate error:", e);
   }
 };
