@@ -1,7 +1,20 @@
-// api/telegram.js — minimal webhook (no Telegraf), replies to /start
+// api/telegram.js — minimal, safe webhook (no Telegraf)
 const axios = require("axios");
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) throw new Error("BOT_TOKEN missing");
+
+// tiny JSON body reader (Vercel Node functions may not parse req.body)
+function readJson(req) {
+  return new Promise((resolve) => {
+    if (req.body && typeof req.body === "object") return resolve(req.body);
+    let data = "";
+    req.on("data", (c) => (data += c));
+    req.on("end", () => {
+      try { resolve(JSON.parse(data || "{}")); }
+      catch { resolve({}); }
+    });
+  });
+}
 
 async function send(chat_id, text, extra = {}) {
   const url = `https://api.telegram.org/bot${TOKEN}/sendMessage`;
@@ -11,10 +24,11 @@ async function send(chat_id, text, extra = {}) {
 module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") {
-      // So a GET to this URL returns 200 (helps debugging + Telegram health)
-      return res.status(200).json({ ok: true, hint: "POST updates here" });
+      // helpful GET for sanity checks
+      return res.status(200).json({ ok: true, hint: "POST Telegram updates here" });
     }
-    const upd = req.body || {};
+
+    const upd = await readJson(req);
     const msg = upd.message || upd.edited_message;
 
     if (msg?.chat?.id && typeof msg.text === "string") {
@@ -36,6 +50,7 @@ module.exports = async (req, res) => {
         return res.status(200).json({ ok: true });
       }
 
+      // fallback
       await send(chatId, "Use `/call <MINT_OR_0x>` to submit a call.", { disable_web_page_preview: true });
       return res.status(200).json({ ok: true });
     }
@@ -43,7 +58,7 @@ module.exports = async (req, res) => {
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error("webhook error:", e?.response?.data || e.message);
-    // Always 200 so Telegram doesn't spam retries
+    // Always 200 so Telegram doesn't retry storm
     return res.status(200).json({ ok: true, note: "handled with error" });
   }
 };
