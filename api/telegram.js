@@ -1,5 +1,6 @@
-export const config = { runtime: "edge", regions: ["fra1"] }; // pick the closest region
+export const config = { runtime: "edge", regions: ["fra1"] };
 
+// --- UI helpers ---
 function startCaption() {
   const ch = process.env.COMMUNITY_CHANNEL_URL || "https://t.me/";
   return [
@@ -30,6 +31,8 @@ function startKeyboard() {
     ],
   };
 }
+const SOL_BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const BSC_HEX40 = /^0x[a-fA-F0-9]{40}$/;
 
 async function tg(method, body) {
   const url = `https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`;
@@ -40,7 +43,6 @@ async function tg(method, body) {
   });
   return r.ok;
 }
-const ackCb = (id) => tg("answerCallbackQuery", { callback_query_id: id });
 const sendMsg = (chat_id, text, extra = {}) =>
   tg("sendMessage", {
     chat_id,
@@ -58,9 +60,10 @@ const sendPhoto = (chat_id, photo, caption, extra = {}) =>
     disable_web_page_preview: true,
     ...extra,
   });
+const ackCb = (id) => tg("answerCallbackQuery", { callback_query_id: id });
 
 export default async function handler(req) {
-  // GET → health check (also lets you open the URL in a browser)
+  // allow opening in the browser
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ ok: true, hint: "POST updates here" }), {
       headers: { "content-type": "application/json" },
@@ -69,33 +72,52 @@ export default async function handler(req) {
 
   let update;
   try { update = await req.json(); } catch { update = {}; }
+  const origin = new URL(req.url).origin; // e.g. https://mooncall.vercel.app
 
-  // message: /start
+  // messages
   if (update?.message?.chat?.id) {
     const chatId = update.message.chat.id;
     const text = (update.message.text || "").trim();
+    const from = update.message.from || {};
 
     if (text.startsWith("/start")) {
       const banner = process.env.START_BANNER_URL;
       const kb = { reply_markup: startKeyboard() };
       if (banner) await sendPhoto(chatId, banner, startCaption(), kb);
       else await sendMsg(chatId, startCaption(), kb);
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
     }
-    // ignore other texts for now
-    return new Response(JSON.stringify({ ok: true }), {
-      headers: { "content-type": "application/json" },
-    });
+
+    // If user pasted a token address, forward to the Node API to create the call
+    if (SOL_BASE58.test(text) || BSC_HEX40.test(text)) {
+      const resp = await fetch(`${origin}/api/call`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-internal": process.env.INTERNAL_API_SECRET || "",
+        },
+        body: JSON.stringify({
+          tgId: String(from.id),
+          username: from.username || null,
+          address: text,
+        }),
+      }).catch(() => null);
+
+      let j = null;
+      if (resp) { try { j = await resp.json(); } catch {} }
+      if (j?.ok) await sendMsg(chatId, "✅ Call recorded and posted.");
+      else await sendMsg(chatId, `❌ ${j?.error || "Could not create the call. Try again later."}`);
+      return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+    }
+
+    // otherwise ignore
+    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
   }
 
-  // callback buttons
+  // buttons
   if (update?.callback_query?.id) {
     const cq = update.callback_query;
-    // ACK quickly; don't wait for the rest
-    ackCb(cq.id);
-
+    ackCb(cq.id); // fast ACK
     const chatId = cq.message?.chat?.id;
     if (chatId) {
       switch (cq.data) {
@@ -116,12 +138,8 @@ export default async function handler(req) {
           break;
       }
     }
-    return new Response(JSON.stringify({ ok: true }), {
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
   }
 
-  return new Response(JSON.stringify({ ok: true }), {
-    headers: { "content-type": "application/json" },
-  });
+  return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
 }
