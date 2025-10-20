@@ -1,168 +1,255 @@
 // mooncall.js
 require("dotenv").config();
-require("./model/db");
-
 const { Telegraf, Markup } = require("telegraf");
+require("./model/db"); // ensures Mongo connects
 const Call = require("./model/call.model");
-const { getPriceAndMc, isSol, isEvm } = require("./price");
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const CH_ID = process.env.ALERTS_CHANNEL_ID;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// --- ENV ---
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const BOT_USERNAME = process.env.BOT_USERNAME || "your_bot";
+const COMMUNITY_CHANNEL_URL = process.env.COMMUNITY_CHANNEL_URL || "https://t.me/your_channel";
 
-const pending = new Map(); // simple in-memory "await CA" state
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing in .env");
 
-const fmtUSD = (n) =>
-  n === null || n === undefined
-    ? "—"
-    : "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+const bot = new Telegraf(BOT_TOKEN);
 
-const shorten = (s) => (s.length <= 10 ? s : s.slice(0, 4) + "…" + s.slice(-4));
+// ---------- helpers ----------
+const fmt = new Intl.NumberFormat("en-US");
+const money = (n) => (n == null ? "—" : `$${fmt.format(Math.round(n))}`);
+const xfmt = (x) => (x == null ? "—" : `${x.toFixed(2)}×`);
+const mention = (handle, id) => (handle ? `@${handle}` : `tg://user?id=${id}`);
 
-function mainKeyboard() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("📣 Community Calls", "cmd:open_channel")],
-    [
-      Markup.button.callback("🏅 Top Callers", "cmd:top"),
-      Markup.button.callback("📞 Make a call", "cmd:make"),
-    ],
-    [
-      Markup.button.callback("📋 My calls", "cmd:mycalls"),
-      Markup.button.callback("📜 Rules", "cmd:rules"),
-    ],
-  ]);
+function startCard() {
+  const text =
+`Welcome to Mooncall bot.
+
+Call tokens, track PnL, and compete for rewards.
+
+» Each user can make 1 call per day
+» Calls are tracked by PnL performance
+» The top performer gets rewards + bragging rights
+
+⚡ Telegram Channel`;
+
+  return {
+    text,
+    keyboard: Markup.inlineKeyboard([
+      [Markup.button.url("⚡ Telegram Channel", COMMUNITY_CHANNEL_URL)],
+      [Markup.button.callback("👥 Community Calls", "cmd:community")],
+      [
+        Markup.button.callback("🥇 Top Callers", "cmd:leaders"),
+        Markup.button.callback("🧾 Make a call", "cmd:make"),
+      ],
+      [
+        Markup.button.callback("📒 My calls", "cmd:mycalls"),
+        Markup.button.callback("📜 Rules", "cmd:rules"),
+      ],
+      [
+        Markup.button.url("⭐ Subscribe", COMMUNITY_CHANNEL_URL),
+        Markup.button.url("🚀 Boost", COMMUNITY_CHANNEL_URL),
+      ],
+      [Markup.button.url("⚡ Boosted Coins", COMMUNITY_CHANNEL_URL)],
+    ]),
+  };
 }
 
-bot.start(async (ctx) => {
-  const text = [
-    "Welcome to Mooncall bot.",
-    "",
-    "Call tokens, track PnL, and compete for rewards.",
-    "",
-    "» Each user can make 1 call per day",
-    "» Calls are tracked by PnL performance",
-    "» The top performer gets rewards + bragging rights",
-    "",
-    "⚡ <a href=\"" +
-      (process.env.COMMUNITY_CHANNEL_URL || "https://t.me/") +
-      "\">Telegram</a>",
-  ].join("\n");
+function startOnly() {
+  const { text, keyboard } = startCard();
+  return { text, extra: { ...keyboard, disable_web_page_preview: false } };
+}
 
-  await ctx.reply(text, {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...mainKeyboard(),
-  });
+function chainTag(chain) {
+  if (chain === "bsc") return "#BSC (PancakeSwap)";
+  return "#SOL (PumpFun)";
+}
+
+// ---------- commands ----------
+bot.start(async (ctx) => {
+  const { text, extra } = startOnly();
+  await ctx.reply(text, extra);
+  // Hint prompt
+  await ctx.reply("Paste the token address (SOL mint 32–44 chars or BSC 0x...).");
 });
 
-// Buttons
-bot.action("cmd:open_channel", async (ctx) => {
+// “Make a call” button = same prompt
+bot.action("cmd:make", async (ctx) => {
   await ctx.answerCbQuery();
-  const url = process.env.COMMUNITY_CHANNEL_URL || "https://t.me/";
-  await ctx.reply(`Open channel: ${url}`);
+  await ctx.reply("Paste the token address (SOL mint 32–44 chars or BSC 0x...).");
+});
+
+// Community / Rules shortcuts (text only)
+bot.action("cmd:community", async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply("Community Calls live in our channel:", Markup.inlineKeyboard([
+    Markup.button.url("Open channel", COMMUNITY_CHANNEL_URL),
+  ]));
 });
 
 bot.action("cmd:rules", async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(
-    [
-      "📜 Rules:",
-      "• One call per 24h per user (admins bypass).",
-      "• Paste a valid SOL mint or BSC 0x address.",
-      "• PnL/MC updates are tracked automatically.",
-      "• Milestones: " + (process.env.MILESTONES || "2,4,6,10"),
-    ].join("\n")
-  );
+  const msg =
+`📜 Rules
+
+• 1 call per user per 24h
+• Post a valid mint/CA only (SOL mint or BSC 0x…)
+• We track MC and X performance automatically
+• No spam/scams — mods may remove any call`;
+  await ctx.reply(msg);
 });
 
-bot.action("cmd:make", async (ctx) => {
-  await ctx.answerCbQuery();
-  pending.set(String(ctx.from.id), true);
-  await ctx.reply("Paste the token address (SOL mint 32–44 chars or BSC 0x...).");
-});
-
-bot.action("cmd:mycalls", async (ctx) => {
-  await ctx.answerCbQuery();
+// ---------- /mycalls ----------
+bot.command("mycalls", async (ctx) => {
   const tgId = String(ctx.from.id);
-  const calls = await Call.find({ tgId }).sort({ createdAt: -1 }).limit(50);
-
-  if (!calls.length) return ctx.reply("You have no calls yet.");
-
-  const lines = ["🧾 Your calls (@" + (ctx.from.username || "unknown") + ")", ""];
-  for (const c of calls) {
-    const title = c.ticker ? `$${c.ticker}` : shorten(c.ca);
-    const now = c.lastMcUsd ? `${fmtUSD(c.lastMcUsd)}` : "—";
-    lines.push(
-      `• ${title}\n   MC when called: ${fmtUSD(c.entryMcUsd)}\n   MC now: ${now}`
-    );
-  }
-  await ctx.reply(lines.join("\n"));
-});
-
-// Text handler: capture CA after /makecall
-bot.on("text", async (ctx) => {
-  const uid = String(ctx.from.id);
-  if (!pending.get(uid)) return;
-
-  const raw = (ctx.message.text || "").trim();
-  if (!isSol(raw) && !isEvm(raw)) {
-    return ctx.reply("That doesn't look like a SOL mint or BSC contract. Try again.");
-  }
-
-  // 24h limit by tgId (admins bypass)
-  const isAdmin = ADMIN_IDS.includes(uid);
-  if (!isAdmin) {
-    const cut = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const recent = await Call.findOne({ tgId: uid, createdAt: { $gt: cut } });
-    if (recent) {
-      pending.delete(uid);
-      return ctx.reply("You already made a call in the last 24h. Try again tomorrow.");
-    }
-  }
-
-  const chain = isSol(raw) ? "sol" : "bsc";
-
-  // price + marketcap
-  const info = await getPriceAndMc(raw, chain);
-  if (!info.priceUsd || !info.mcUsd) {
-    return ctx.reply("Price unavailable at the moment. Try again in a few minutes.");
-  }
-
   const handle = ctx.from.username || null;
 
-  const call = await Call.create({
-    tgId: uid,
-    handle,
-    ca: raw,
-    chain,
-    ticker: info.ticker || "",
-    entryPriceUsd: info.priceUsd,
-    entryMcUsd: info.mcUsd,
-    lastPriceUsd: info.priceUsd,
-    lastMcUsd: info.mcUsd,
-    peakMcUsd: info.mcUsd,
-    milestonesHit: {},
+  const calls = await Call
+    .find({ userId: tgId })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean();
+
+  if (!calls.length) {
+    return ctx.reply("You don’t have any calls yet. Use “Make a call”.");
+  }
+
+  const header = `🧾 Your calls (${mention(handle, tgId)})`;
+  const lines = calls.map((c) => {
+    const t = c.ticker ? `$${c.ticker}` : (c.chain === "bsc" ? "$BSC" : "$SOL");
+    return [
+      `• ${t}`,
+      `   MC when called: ${money(c.entryMc)}`,
+      `   MC now: ${money(c.lastMc)}${c.lastMc!=null && c.entryMc!=null ? ` (${(((c.lastMc-c.entryMc)/c.entryMc)*100).toFixed(1)}%)` : ""}`
+    ].join("\n");
   });
 
-  pending.delete(uid);
-
-  // confirm
-  const title = call.ticker ? `$${call.ticker}` : shorten(call.ca);
-  await ctx.reply(
-    [
-      "✅ Call saved!",
-      `Token: ${title}`,
-      `Called MC: ${fmtUSD(call.entryMcUsd)}`,
-      `We’ll track it & alert milestones.`,
-    ].join("\n")
-  );
+  await ctx.reply([header, "", ...lines].join("\n"));
 });
 
-bot.catch((e) => console.error("bot error", e));
-bot.launch().then(() => console.log("@mooncall_bot ready"));
+// Button -> /mycalls
+bot.action("cmd:mycalls", async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.state.calledFromButton = true;
+  await bot.handleUpdate({ message: { ...ctx.update.callback_query.message, text: "/mycalls", from: ctx.from, chat: ctx.chat } });
+});
 
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+// ---------- /leaderboard ----------
+bot.command("leaderboard", async (ctx) => {
+  // rank by best peakMultiple per user (top 10)
+  const top = await Call.aggregate([
+    { $match: { peakMultiple: { $gt: 1 } } },
+    { $group: {
+        _id: "$userId",
+        handle: { $last: "$userHandle" },
+        bestX: { $max: "$peakMultiple" },
+        totalCalls: { $sum: 1 },
+      }
+    },
+    { $sort: { bestX: -1 } },
+    { $limit: 10 }
+  ]);
+
+  if (!top.length) return ctx.reply("No leaderboard data yet. Make some calls first!");
+
+  const medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
+  const lines = top.map((u, i) => {
+    const tag = mention(u.handle, u._id);
+    return `${medals[i]} ${tag} — Best: ${xfmt(u.bestX)}  • Calls: ${u.totalCalls}`;
+  });
+
+  const text = ["🏆 Top Callers (best X)", "", ...lines].join("\n");
+  await ctx.reply(text, { disable_web_page_preview: true });
+});
+
+// Button -> /leaderboard
+bot.action("cmd:leaders", async (ctx) => {
+  await ctx.answerCbQuery();
+  ctx.state.calledFromButton = true;
+  await bot.handleUpdate({ message: { ...ctx.update.callback_query.message, text: "/leaderboard", from: ctx.from, chat: ctx.chat } });
+});
+
+// ---------- Handle MEDIA: show /start ----------
+const mediaUpdates = [
+  "photo","video","animation","sticker","document","audio","voice",
+  "video_note","contact","location","poll"
+];
+for (const t of mediaUpdates) {
+  bot.on(t, async (ctx) => {
+    const { text, extra } = startOnly();
+    await ctx.reply(text, extra);
+  });
+}
+
+// ---------- Mint/CA intake (simple) ----------
+// This keeps whatever CA-intake flow you already have in worker,
+// here we just save basic shell for the card + "we'll track it".
+const SOL_MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const BSC_CA = /^0x[a-fA-F0-9]{40}$/;
+
+bot.on("text", async (ctx, next) => {
+  const text = (ctx.message && ctx.message.text || "").trim();
+
+  // Let command handlers run
+  if (text.startsWith("/")) return next();
+
+  // Looks like a CA/mint? Save minimal info; your worker will enrich (price/MC/peaks)
+  const isSol = SOL_MINT.test(text);
+  const isBsc = BSC_CA.test(text);
+
+  if (!isSol && !isBsc) {
+    // Not a CA: just gently show start again
+    const { text: s, extra } = startOnly();
+    return ctx.reply(s, extra);
+  }
+
+  const tgId = String(ctx.from.id);
+  const handle = ctx.from.username || null;
+
+  // soft limit: 1 call / 24h unless admin bypass is in your worker
+  const since = new Date(Date.now() - 24*60*60*1000);
+  const recent = await Call.findOne({ userId: tgId, createdAt: { $gt: since } });
+  if (recent) {
+    return ctx.reply("You already made a call in the last 24h.");
+  }
+
+  const chain = isBsc ? "bsc" : "sol";
+  const ca = text;
+  const ticker = chain === "bsc" ? "" : ""; // worker can discover later
+  const now = new Date();
+
+  const call = await Call.create({
+    userId: tgId,
+    userHandle: handle,
+    chain,
+    ca,
+    ticker,
+    entryMc: null,
+    lastMc: null,
+    peakMultiple: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  const header = "✅ Call saved!";
+  const tokenLine = `Token: ${ticker ? `$${ticker}` : (chain === "bsc" ? "$BSC" : "$SOL")}`;
+  const mcLine = `Called MC: ${money(call.entryMc)}`;
+  await ctx.reply([header, tokenLine, mcLine, "We’ll track it & alert milestones."].join("\n"));
+
+  // Immediately echo one line in “my calls” style
+  const my = `🧾 Your calls (${mention(handle, tgId)})\n\n• ${ticker ? `$${ticker}` : (chain === "bsc" ? "$BSC" : "$SOL")}\n   MC when called: ${money(call.entryMc)}\n   MC now: ${money(call.lastMc)}`;
+  await ctx.reply(my, { disable_web_page_preview: true });
+});
+
+// ---------- errors & launch ----------
+bot.catch((err, ctx) => {
+  console.error("Unhandled error while processing", ctx.update);
+  console.error(err);
+});
+
+async function main() {
+  await bot.launch();
+  console.log("@", BOT_USERNAME, "ready");
+}
+
+main();
+process.on("SIGINT", () => bot.stop("SIGINT"));
+process.on("SIGTERM", () => bot.stop("SIGTERM"));
