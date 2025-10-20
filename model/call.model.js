@@ -1,40 +1,33 @@
 // model/call.model.js
-const { Schema, model, models } = require("mongoose");
+const mongoose = require("mongoose");
 
-const CallSchema = new Schema({
-  telegramId: { type: String, index: true },
-  userId: { type: String },
-  callerHandle: { type: String },
+const CallSchema = new mongoose.Schema(
+  {
+    // who
+    userTgId: { type: String, index: true },
+    userHandle: { type: String }, // e.g. "crypto_enjoyer01"
 
-  chain: { type: String, enum: ["sol","bsc"], required: true },
-  mintAddress: { type: String, required: true, index: true },
+    // token
+    chain: { type: String, enum: ["sol", "bsc"], default: "sol" }, // infer at save time
+    tokenMint: { type: String, index: true }, // SOL mint or BSC 0x
+    symbol: { type: String },                 // $TICKER if you store it
 
-  thesis: { type: String, default: "" },
+    // prices / mc
+    entryPrice: { type: Number }, // required for PnL math
+    entryMc: { type: Number },    // optional (market cap at call time)
 
-  entryPrice: { type: Number, default: 0 },
-  lastPrice: { type: Number, default: null },
-  peakPrice: { type: Number, default: null },
-  peakMultiple: { type: Number, default: null },
+    lastPrice: { type: Number },
+    lastMc: { type: Number },
 
-  entryMc: { type: Number, default: null },
+    peakPrice: { type: Number },
+    peakMc: { type: Number },
 
-  // milestone flags like hit2x/hit4x/...
-  hit2x: { type: Boolean, default: false },
-  hit3x: { type: Boolean, default: false },
-  hit4x: { type: Boolean, default: false },
-  hit5x: { type: Boolean, default: false },
-  hit6x: { type: Boolean, default: false },
-  hit8x: { type: Boolean, default: false },
-  hit10x: { type: Boolean, default: false },
+    // milestones and rules
+    milestonesHit: { type: mongoose.Schema.Types.Mixed, default: {} }, // e.g. { "hit_2x": true }
+    lastIntXNotified: { type: Number, default: 0 }, // last ≥10x integer milestone sent
+    trackingDisabled: { type: Boolean, default: false },
+  },
+  { timestamps: { createdAt: true, updatedAt: true } }
+);
 
-  dumpAlerted: { type: Boolean, default: false },
-
-  nextMilestone: { type: Number, default: 2 },
-
-  status: { type: String, enum:["active","expired"], default: "active", index: true },
-  nextCheckAt: { type: Date, default: () => new Date(Date.now()+60*60*1000), index: true },
-  expiresAt: { type: Date },
-
-}, { timestamps: true });
-
-module.exports = models.Call || model("Call", CallSchema);
+module.exports = mongoose.models.Call || mongoose.model("Call", CallSchema);

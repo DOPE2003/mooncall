@@ -1,11 +1,14 @@
 // model/settings.model.js
-const { Schema, model, models } = require("mongoose");
+const mongoose = require("mongoose");
 
-const SettingsSchema = new Schema({
-  _id: { type: String, default: "global" },
-  milestones: { type: [Number], default: [2,4,6,10] },
-  checkIntervalMinutes: { type: Number, default: 60 },
-  paused: { type: Boolean, default: false }
-}, { _id: false });
+const SettingsSchema = new mongoose.Schema(
+  {
+    _id: { type: String, default: "global" },
+    milestones: { type: [Number], default: undefined },
+    checkIntervalMinutes: { type: Number, default: undefined },
+    paused: { type: Boolean, default: false }
+  },
+  { timestamps: true, _id: false }
+);
 
-module.exports = models.Settings || model("Settings", SettingsSchema);
+module.exports = mongoose.model("Settings", SettingsSchema);
