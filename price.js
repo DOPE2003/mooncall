@@ -1,80 +1,66 @@
 // price.js
 const axios = require("axios");
 
-/**
- * Try Dexscreener first for both SOL & BSC.
- * For SOL, fall back to Jupiter if no pairs are returned.
- * Returns: { price: number, mc?: number|null }
- */
-async function getPrice(tokenAddress, chain) {
-  if (!tokenAddress) throw new Error("missing tokenAddress");
+const JUP = process.env.JUPITER_PRICE_URL || "https://lite-api.jup.ag/price/v3?ids=";
 
-  // 1) Dexscreener
-  const dexPair = await fromDexscreener(tokenAddress, chain).catch(() => null);
-  if (dexPair && isFiniteNum(dexPair.price)) {
-    return { price: dexPair.price, mc: dexPair.mc ?? null };
+const isSol = (x) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(x);
+const isEvm = (x) => /^0x[a-fA-F0-9]{40}$/.test(x);
+
+// Dexscreener gives priceUsd + fdv/marketCap + ticker for SOL & BSC
+async function fromDexscreener(ca) {
+  try {
+    const { data } = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${ca}`,
+      { timeout: 8000 }
+    );
+    const p = data?.pairs?.[0];
+    const price = Number(p?.priceUsd);
+    const mc = Number(p?.fdv || p?.marketCap);
+    const ticker = p?.baseToken?.symbol || "";
+    return {
+      priceUsd: Number.isFinite(price) ? price : null,
+      mcUsd: Number.isFinite(mc) ? mc : null,
+      ticker,
+    };
+  } catch {
+    return { priceUsd: null, mcUsd: null, ticker: "" };
   }
-
-  // 2) Jupiter fallback (SOL only)
-  if ((chain || "").toLowerCase() === "sol") {
-    const j = await fromJupiter(tokenAddress).catch(() => null);
-    if (j && isFiniteNum(j.price)) return { price: j.price, mc: null };
-  }
-
-  throw new Error("price unavailable");
 }
 
-function isFiniteNum(n) {
-  return typeof n === "number" && Number.isFinite(n);
-}
-
-async function fromDexscreener(addr, chain) {
-  const url = `https://api.dexscreener.com/latest/dex/tokens/${addr}`;
-  const { data } = await axios.get(url, { timeout: 8000 });
-  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-  if (!pairs.length) return null;
-
-  const want = (chain || "").toLowerCase() === "bsc" ? "bsc" : "solana";
-  const filtered = pairs.filter(p => (p?.chainId || "").toLowerCase() === want);
-  if (!filtered.length) return null;
-
-  // choose the deepest pool
-  filtered.sort((a, b) => (num(b?.liquidity?.usd) - num(a?.liquidity?.usd)));
-  const p = filtered[0];
-
-  const price = num(p?.priceUsd);
-  // dex returns marketCap for some nets; fdv is more common
-  const mc = isFiniteNum(num(p?.marketCap)) ? num(p?.marketCap)
-          : isFiniteNum(num(p?.fdv))       ? num(p?.fdv)
-          : null;
-
-  if (!isFiniteNum(price)) return null;
-  return { price, mc };
-}
-
+// Jupiter fallback (SOL only)
 async function fromJupiter(mint) {
-  // Prefer lite v3, fall back to v4
-  const v3 = process.env.JUPITER_PRICE_URL || "https://lite-api.jup.ag/price/v3?ids=";
   try {
-    const { data } = await axios.get(v3 + encodeURIComponent(mint), { timeout: 8000 });
-    const d = data?.data?.[mint];
-    const price = num(d?.price ?? d?.priceUsd);
-    if (isFiniteNum(price)) return { price };
-  } catch {}
-
-  try {
-    const { data } = await axios.get(`https://price.jup.ag/v4/price?ids=${encodeURIComponent(mint)}`, { timeout: 8000 });
+    const { data } = await axios.get(JUP + encodeURIComponent(mint), {
+      timeout: 8000,
+    });
     const first = Object.values(data?.data || {})[0];
-    const price = num(first?.price);
-    if (isFiniteNum(price)) return { price };
-  } catch {}
-
-  return null;
+    const price = Number(first?.price);
+    return { priceUsd: Number.isFinite(price) ? price : null };
+  } catch {
+    return { priceUsd: null };
+  }
 }
 
-function num(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : NaN;
+/**
+ * getPriceAndMc(ca, chain?)
+ * Returns { priceUsd, mcUsd, ticker }
+ */
+async function getPriceAndMc(ca, chain) {
+  // 1) Dexscreener for both chains
+  let d = await fromDexscreener(ca);
+
+  // 2) Fallback: SOL price via Jupiter
+  if (!d.priceUsd && (chain === "sol" || isSol(ca))) {
+    const j = await fromJupiter(ca);
+    d.priceUsd = d.priceUsd || j.priceUsd;
+  }
+
+  // 3) If still missing MC but we have a price, apply a safe heuristic
+  if (!d.mcUsd && d.priceUsd) {
+    // Many meme tokens start at ~1B supply on SOL. Heuristic is better than "—".
+    d.mcUsd = Math.round(d.priceUsd * 1_000_000_000);
+  }
+  return d;
 }
 
-module.exports = { getPrice };
+module.exports = { getPriceAndMc, isSol, isEvm };

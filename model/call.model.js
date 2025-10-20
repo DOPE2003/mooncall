@@ -1,33 +1,33 @@
 // model/call.model.js
-const mongoose = require("mongoose");
+const mongoose = require("../model/db");
 
 const CallSchema = new mongoose.Schema(
   {
     // who
-    userTgId: { type: String, index: true },
-    userHandle: { type: String }, // e.g. "crypto_enjoyer01"
+    tgId: { type: String, index: true, required: true },
+    handle: { type: String },
 
-    // token
-    chain: { type: String, enum: ["sol", "bsc"], default: "sol" }, // infer at save time
-    tokenMint: { type: String, index: true }, // SOL mint or BSC 0x
-    symbol: { type: String },                 // $TICKER if you store it
+    // what
+    ca: { type: String, required: true, index: true }, // contract / mint
+    chain: { type: String, enum: ["sol", "bsc"], required: true },
+    ticker: { type: String, default: "" },
 
-    // prices / mc
-    entryPrice: { type: Number }, // required for PnL math
-    entryMc: { type: Number },    // optional (market cap at call time)
+    // prices / MC (USD)
+    entryPriceUsd: { type: Number, default: 0 },
+    entryMcUsd: { type: Number, default: 0 },
 
-    lastPrice: { type: Number },
-    lastMc: { type: Number },
+    lastPriceUsd: { type: Number, default: 0 },
+    lastMcUsd: { type: Number, default: 0 },
 
-    peakPrice: { type: Number },
-    peakMc: { type: Number },
+    peakMcUsd: { type: Number, default: 0 },
 
-    // milestones and rules
-    milestonesHit: { type: mongoose.Schema.Types.Mixed, default: {} }, // e.g. { "hit_2x": true }
-    lastIntXNotified: { type: Number, default: 0 }, // last ≥10x integer milestone sent
-    trackingDisabled: { type: Boolean, default: false },
+    // milestones (flags); keys: 'x2','x4',... and 'int_10','int_11',... after 10x
+    milestonesHit: { type: Object, default: {} },
+
+    // housekeeping
+    startedAt: { type: Date, default: () => new Date() },
   },
-  { timestamps: { createdAt: true, updatedAt: true } }
+  { timestamps: true }
 );
 
-module.exports = mongoose.models.Call || mongoose.model("Call", CallSchema);
+module.exports = mongoose.model("Call", CallSchema);

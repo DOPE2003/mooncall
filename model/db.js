@@ -9,13 +9,11 @@ if (!uri) {
 
 mongoose.set("strictQuery", true);
 
-mongoose.connect(uri, {
-  autoIndex: true
-}).then(() => {
-  console.log("✅ Mongo connected");
-}).catch((e) => {
-  console.error("❌ Mongo connection error:", e.message);
-  process.exit(1);
-});
+mongoose.connect(uri, { autoIndex: true })
+  .then(() => console.log("✅ Mongo connected"))
+  .catch((e) => {
+    console.error("❌ Mongo connection error:", e.message);
+    process.exit(1);
+  });
 
 module.exports = mongoose;

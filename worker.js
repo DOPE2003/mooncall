@@ -1,115 +1,139 @@
 // worker.js
 require("dotenv").config();
-const { Telegram } = require("telegraf");
 require("./model/db");
-const Call = require("./model/call.model");
-const { getPrice } = require("./price");
 
-const tg = new Telegram(process.env.BOT_TOKEN);
+const Call = require("./model/call.model");
+const { getPriceAndMc } = require("./price");
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const CH_ID = process.env.ALERTS_CHANNEL_ID;
 
-const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 5);
-const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);
-const MILES = (process.env.MILESTONES || "2,4,6,10")
-  .split(",").map(s => Number(s.trim())).filter(n => !Number.isNaN(n) && n > 1)
-  .sort((a,b) => a - b);
+const MILESTONES = (process.env.MILESTONES || "2,4,6,10")
+  .split(",")
+  .map((x) => Number(x.trim()))
+  .filter((x) => x > 1)
+  .sort((a, b) => a - b);
 
-function shortMint(m) { if (!m) return "unknown"; return m.startsWith("0x") ? m.slice(0,4)+"…"+m.slice(-4) : m.slice(0,4)+"…"+m.slice(-4); }
-function symbolOrFallback(call) { return (call.symbol || "").trim(); }
-function chainFromMint(call, ca) { return call.chain || (ca?.startsWith("0x") ? "bsc" : "sol"); }
-function fmtMoney(n){ if(n==null||Number.isNaN(n))return "—"; const a=Math.abs(n); if(a>=1e9)return `$${(n/1e9).toFixed(1)}B`; if(a>=1e6)return `$${(n/1e6).toFixed(1)}M`; if(a>=1e3)return `$${(n/1e3).toFixed(1)}K`; return `$${n.toFixed(0)}`; }
-function fmtSince(start, now=new Date()){ const ms=Math.max(0, now - new Date(start)); const m=Math.floor(ms/60000); const h=Math.floor(m/60); const mm=m%60; if(h>=24){const d=Math.floor(h/24); const hh=h%24; return `${d}d ${hh}h`;} return `${h}h:${String(mm).padStart(2,"0")}m`; }
+const CHECK_MS = Math.max(1, Number(process.env.CHECK_INTERVAL_MINUTES || 5)) * 60 * 1000;
 
-function parseTradeBots(chain){
-  const line = chain === "bsc" ? process.env.TRADE_BOTS_BSC : process.env.TRADE_BOTS_SOL;
-  const out=[]; if(!line) return out;
-  for(const part of line.split(",")){ const [label,link]=part.split("|").map(s=>s?.trim()); if(label&&link){ const url = link.startsWith("@")?`https://t.me/${link.slice(1)}`:link; out.push({text:label,url}); } }
-  return out;
-}
-function buildKeyboard(call, ca){
-  const chain = chainFromMint(call, ca);
-  const chart = { text: "📈 Chart", url: chain==="bsc" ? `https://dexscreener.com/bsc/${ca}` : `https://dexscreener.com/solana/${ca}` };
-  const trade = { text: "🌕 Trade", url: chain==="bsc" ? `https://pancakeswap.finance/?outputCurrency=${ca}` : `https://jup.ag/swap/USDC-${ca}` };
-  const bots = parseTradeBots(chain);
-  const rows = [[chart, trade]];
-  for (let i=0;i<bots.length;i+=2) rows.push(bots.slice(i,i+2));
-  return { inline_keyboard: rows };
-}
+const fmtUSD = (n) =>
+  n === null || n === undefined
+    ? "—"
+    : "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 
-async function sendSub10xAlert(call, milestoneX, nowMc, ca){
-  const sym = symbolOrFallback(call);
-  const since = fmtSince(call.createdAt);
-  const entryMc = call.entryMc ?? null;
-  const msg =
-`${"🚀".repeat(Math.min(milestoneX, 30))} ${sym ? `$${sym}` : shortMint(ca)} hit ${milestoneX.toFixed(2)}× since call!
+const ago = (d) => {
+  const ms = Date.now() - new Date(d).getTime();
+  const m = Math.floor(ms / 60000);
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return (h ? `${h}h:` : "") + `${mm}m`;
+};
 
-Called at MC: ${fmtMoney(entryMc)} by @${call.userHandle || "unknown"}
-Now MC: ${fmtMoney(nowMc)}
-(since ${since})`;
-  await tg.sendMessage(CH_ID, msg, { disable_web_page_preview:true, reply_markup: buildKeyboard(call, ca) });
+async function postToChannel(text) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: CH_ID,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    console.error("sendMessage failed:", res.status, t);
+  }
 }
 
-async function send10xPlusAlert(call, intX, nowMc, ca){
-  const sym = symbolOrFallback(call);
-  const head = sym ? `🌕 $${sym}` : `🌕 ${shortMint(ca)}`;
-  const since = fmtSince(call.createdAt);
-  const entryMc = call.entryMc ?? null;
-  const by = call.userHandle ? ` by @${call.userHandle}` : "";
-  const msg = `${head} ${intX}x | ⚡️From ${fmtMoney(entryMc)} 🚀 ${fmtMoney(nowMc)} within ${since}${by}`;
-  await tg.sendMessage(CH_ID, msg, { disable_web_page_preview:true, reply_markup: buildKeyboard(call, ca) });
+function rockets(mult) {
+  const n = Math.min(Math.max(Math.floor(mult), 2) * 2, 30);
+  return "🚀".repeat(n);
+}
+
+function formatOver10x(call, nowMc) {
+  const x = call.entryMcUsd > 0 ? nowMc / call.entryMcUsd : 0;
+  const intX = Math.floor(x);
+  const name = call.ticker ? `$${call.ticker}` : call.ca.slice(0, 4) + "…" + call.ca.slice(-4);
+  return [
+    `🌕 <b>${name} ${intX}x</b> | ⚡️From ${fmtUSD(call.entryMcUsd)} 🚀 ${fmtUSD(nowMc)} within ${ago(call.createdAt)}`,
+    call.handle ? `by @${call.handle}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatMilestone(call, nowMc, multiple, nextMs) {
+  const name = call.ticker ? `$${call.ticker}` : call.ca.slice(0, 4) + "…" + call.ca.slice(-4);
+  return [
+    `${rockets(multiple)} <b>${name}</b> hit <b>${multiple.toFixed(2)}×</b> since call!`,
+    "",
+    `Called at MC: ${fmtUSD(call.entryMcUsd)}${call.handle ? ` by @${call.handle}` : ""}`,
+    `Now MC: ${fmtUSD(nowMc)}`,
+    nextMs ? `Next milestone: ${nextMs.toFixed(2)}×` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function tick() {
-  const cutoff = new Date(Date.now() - BASE_DAYS * 24 * 60 * 60 * 1000);
-  const list = await Call.find({ createdAt: { $gt: cutoff }, trackingDisabled: { $ne: true } }).lean();
+  const calls = await Call.find({ entryMcUsd: { $gt: 0 } })
+    .sort({ createdAt: -1 })
+    .limit(500);
 
-  for (const c of list) {
-    // tolerate legacy field names
-    const ca = c.tokenMint || c.mint || c.ca || c.token || c.address;
-    try {
-      if (!c.entryPrice) continue;          // skip if entry missing (see backfill below)
-      if (!ca) { console.warn("skip: missing CA on doc", c._id?.toString()); continue; }
+  for (const call of calls) {
+    if (!call.ca) {
+      console.log("skip: missing CA on doc", call._id.toString());
+      continue;
+    }
 
-      const chain = chainFromMint(c, ca);
-      const { price, mc } = await getPrice(ca, chain);
-      if (!price) continue;
+    const info = await getPriceAndMc(call.ca, call.chain);
+    if (!info.priceUsd || !info.mcUsd) {
+      // unseen tokens may briefly be missing on aggregators
+      // console.log("skip: price unavailable", call.ca);
+      continue;
+    }
 
-      const nowX = price / c.entryPrice;
-      const updates = {
-        lastPrice: price,
-        lastMc: mc ?? c.lastMc ?? null,
-        peakPrice: Math.max(c.peakPrice || 0, price),
-        peakMc: mc != null ? Math.max(c.peakMc || 0, mc) : (c.peakMc ?? null),
-      };
+    const nowMc = info.mcUsd;
+    const entryMc = call.entryMcUsd || 0;
+    if (!entryMc) continue;
 
-      if (nowX < 10) {
-        for (const m of MILES) {
-          if (nowX >= m) {
-            const key = `hit_${m}x`;
-            if (!c.milestonesHit || !c.milestonesHit[key]) {
-              await sendSub10xAlert(c, m, mc, ca);
-              updates.milestonesHit = Object.assign({}, c.milestonesHit, { [key]: true });
-            }
-          }
+    // Update current/peak/ticker
+    call.lastPriceUsd = info.priceUsd;
+    call.lastMcUsd = nowMc;
+    if (!call.peakMcUsd || nowMc > call.peakMcUsd) call.peakMcUsd = nowMc;
+    if (!call.ticker && info.ticker) call.ticker = info.ticker;
+    await call.save();
+
+    const curX = nowMc / entryMc;
+
+    // 1) normal ladder (e.g., 2/4/6/10)
+    for (const m of MILESTONES) {
+      const key = `x${m}`;
+      if (curX >= m && !call.milestonesHit[key]) {
+        call.milestonesHit[key] = true;
+        await call.save();
+        const next = MILESTONES.find((z) => z > m);
+        await postToChannel(formatMilestone(call, nowMc, curX, next));
+      }
+    }
+
+    // 2) after 10x: integer-only alerts 10x, 11x, 12x, ...
+    if (curX >= 10) {
+      const intNow = Math.floor(curX);
+      for (let x = 10; x <= intNow; x++) {
+        const key = `int_${x}`;
+        if (!call.milestonesHit[key]) {
+          call.milestonesHit[key] = true;
+          await call.save();
+          await postToChannel(formatOver10x(call, nowMc));
         }
       }
-
-      if (nowX >= 10) {
-        const intX = Math.floor(nowX);
-        const lastInt = c.lastIntXNotified || 0;
-        if (intX > Math.max(lastInt, 9)) {
-          await send10xPlusAlert(c, intX, mc, ca);
-          updates.lastIntXNotified = intX;
-        }
-      }
-
-      await Call.updateOne({ _id: c._id }, { $set: updates });
-    } catch (e) {
-      console.error("tick error", ca || "unknown-ca", e.message);
     }
   }
 }
 
 console.log("📡 Worker running…");
-setInterval(tick, CHECK_MIN * 60 * 1000);
-tick();
+tick().catch(console.error);
+setInterval(() => tick().catch(console.error), CHECK_MS);
