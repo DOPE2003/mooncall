@@ -310,11 +310,19 @@ bot.catch((err, ctx) => {
   console.error('Unhandled error while processing', ctx.update, err);
 });
 
-// ---- Launch ---------------------------------------------------------------
-bot.launch().then(() => {
-  console.log('🤖 mooncall bot ready');
-});
+// ---- Launch (once) --------------------------------------------------------
+(async () => {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    await bot.launch({ dropPendingUpdates: true });
+    console.log('🤖 mooncall bot ready (polling).');
+  } catch (e) {
+    console.error('Failed to launch bot:', e);
+    process.exit(1);
+  }
+})();
 
 // Graceful stop (Render/PM2)
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
