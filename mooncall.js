@@ -19,6 +19,7 @@ const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE =
   String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
+
 const isAdmin = tgId => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
@@ -186,8 +187,8 @@ bot.on('text', async ctx => {
 
   const chartUrl = info.chartUrl || `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`;
 
-  // Compose card body (includes CA line)
-  const fullCaption = channelCardText({
+  // Compose card body (CA/mint INCLUDED in caption for copyability)
+  const caption = channelCardText({
     user: username,
     tkr: info.ticker || 'Token',
     chain: info.chain,
@@ -197,40 +198,21 @@ bot.on('text', async ctx => {
     dex: info.dex || 'dex',
   });
 
-  // ---- Post to channel (image + separate, copyable CA) ---------------------
+  // ---- Post to channel (image: caption keeps CA line) -----------------------
   let messageId;
   try {
     const kb = tradeKeyboards(info.chain, chartUrl);
 
-    // For photos, caption selection can be awkward. Strip the CA from caption and
-    // post it in a second monospace message for easy copying.
-    const captionWithoutCA = fullCaption.replace(`${caOrMint}\n\n`, '');
-
     if (WANT_IMAGE && info.imageUrl) {
-      try {
-        const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
-          caption: captionWithoutCA,
-          parse_mode: 'HTML',
-          ...kb,
-        });
-        messageId = res?.message_id;
-
-        // post a separate copy-only CA right under the image
-        await ctx.telegram.sendMessage(CH_ID, `<code>${caOrMint}</code>`, {
-          parse_mode: 'HTML',
-        });
-      } catch (_) {
-        // fallback to text
-        const res = await ctx.telegram.sendMessage(CH_ID, fullCaption, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: false,
-          ...kb,
-        });
-        messageId = res?.message_id;
-      }
+      // CA remains inside caption — copyable in the card like the reference
+      const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
+        caption,
+        parse_mode: 'HTML',
+        ...kb,
+      });
+      messageId = res?.message_id;
     } else {
-      // no image: one text message (includes CA inline)
-      const res = await ctx.telegram.sendMessage(CH_ID, fullCaption, {
+      const res = await ctx.telegram.sendMessage(CH_ID, caption, {
         parse_mode: 'HTML',
         disable_web_page_preview: false,
         ...kb,
