@@ -1,139 +1,154 @@
 // worker.js
-require("dotenv").config();
-require("./model/db");
+require('dotenv').config();
+require('./lib/db');
 
-const Call = require("./model/call.model");
-const { getPriceAndMc } = require("./price");
+const { Telegram } = require('telegraf');
+const Call = require('./model/call.model');
+const { getTokenInfo, usd } = require('./lib/price');
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CH_ID = process.env.ALERTS_CHANNEL_ID;
+const tg = new Telegram(process.env.BOT_TOKEN);
+const CH_ID = Number(process.env.ALERTS_CHANNEL_ID || 0);
 
-const MILESTONES = (process.env.MILESTONES || "2,4,6,10")
-  .split(",")
-  .map((x) => Number(x.trim()))
-  .filter((x) => x > 1)
-  .sort((a, b) => a - b);
+const CHECK_MIN = Math.max(1, parseInt(process.env.CHECK_INTERVAL_MINUTES || '5', 10));
+const TRACK_DAYS = Math.max(1, parseInt(process.env.BASE_TRACK_DAYS || '7', 10));
 
-const CHECK_MS = Math.max(1, Number(process.env.CHECK_INTERVAL_MINUTES || 5)) * 60 * 1000;
+console.log('📡 Worker running…');
 
-const fmtUSD = (n) =>
-  n === null || n === undefined
-    ? "—"
-    : "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+function shortAddr(addr, dex = '') {
+  if (!addr) return '—';
+  const head = addr.slice(0, 4);
+  const suffix = dex && dex.toLowerCase().includes('pump') ? 'pump' : 'ca';
+  return `${head}…${suffix}`;
+}
 
-const ago = (d) => {
-  const ms = Date.now() - new Date(d).getTime();
-  const m = Math.floor(ms / 60000);
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return (h ? `${h}h:` : "") + `${mm}m`;
-};
+function compactUsd(n) {
+  if (n == null) return '—';
+  const abs = Math.abs(n);
+  const fmt = (val, unit) =>
+    `$${val.toFixed(val >= 100 ? 0 : 1)}${unit}`;
 
-async function postToChannel(text) {
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: CH_ID,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    console.error("sendMessage failed:", res.status, t);
+  if (abs >= 1_000_000_000) return fmt(n / 1_000_000_000, 'B');
+  if (abs >= 1_000_000) return fmt(n / 1_000_000, 'M');
+  if (abs >= 1_000) return fmt(n / 1_000, 'K');
+  return usd(n); // fall back to full $12,345 format
+}
+
+function elapsedHM(fromDate) {
+  if (!fromDate) return '—';
+  const ms = Date.now() - new Date(fromDate).getTime();
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  return `${h}h:${String(m).padStart(2, '0')}m`;
+}
+
+// Decide which milestone to trigger next.
+// - 2..8: integer thresholds
+// - >=10: every new integer (10, 11, 12, …)
+function nextMilestone(nowX, sentSet) {
+  // 2..8 band
+  for (let k = 2; k <= 8; k++) {
+    if (nowX >= k && !sentSet.has(k)) return k;
   }
-}
-
-function rockets(mult) {
-  const n = Math.min(Math.max(Math.floor(mult), 2) * 2, 30);
-  return "🚀".repeat(n);
-}
-
-function formatOver10x(call, nowMc) {
-  const x = call.entryMcUsd > 0 ? nowMc / call.entryMcUsd : 0;
-  const intX = Math.floor(x);
-  const name = call.ticker ? `$${call.ticker}` : call.ca.slice(0, 4) + "…" + call.ca.slice(-4);
-  return [
-    `🌕 <b>${name} ${intX}x</b> | ⚡️From ${fmtUSD(call.entryMcUsd)} 🚀 ${fmtUSD(nowMc)} within ${ago(call.createdAt)}`,
-    call.handle ? `by @${call.handle}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function formatMilestone(call, nowMc, multiple, nextMs) {
-  const name = call.ticker ? `$${call.ticker}` : call.ca.slice(0, 4) + "…" + call.ca.slice(-4);
-  return [
-    `${rockets(multiple)} <b>${name}</b> hit <b>${multiple.toFixed(2)}×</b> since call!`,
-    "",
-    `Called at MC: ${fmtUSD(call.entryMcUsd)}${call.handle ? ` by @${call.handle}` : ""}`,
-    `Now MC: ${fmtUSD(nowMc)}`,
-    nextMs ? `Next milestone: ${nextMs.toFixed(2)}×` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  // 10+ band
+  const k = Math.floor(nowX);
+  if (k >= 10 && !sentSet.has(k)) return k;
+  return null;
 }
 
 async function tick() {
-  const calls = await Call.find({ entryMcUsd: { $gt: 0 } })
-    .sort({ createdAt: -1 })
-    .limit(500);
+  try {
+    const since = new Date(Date.now() - TRACK_DAYS * 24 * 3600 * 1000);
+    const docs = await Call.find({ createdAt: { $gte: since } })
+      .sort({ createdAt: -1 })
+      .limit(500);
 
-  for (const call of calls) {
-    if (!call.ca) {
-      console.log("skip: missing CA on doc", call._id.toString());
-      continue;
-    }
-
-    const info = await getPriceAndMc(call.ca, call.chain);
-    if (!info.priceUsd || !info.mcUsd) {
-      // unseen tokens may briefly be missing on aggregators
-      // console.log("skip: price unavailable", call.ca);
-      continue;
-    }
-
-    const nowMc = info.mcUsd;
-    const entryMc = call.entryMcUsd || 0;
-    if (!entryMc) continue;
-
-    // Update current/peak/ticker
-    call.lastPriceUsd = info.priceUsd;
-    call.lastMcUsd = nowMc;
-    if (!call.peakMcUsd || nowMc > call.peakMcUsd) call.peakMcUsd = nowMc;
-    if (!call.ticker && info.ticker) call.ticker = info.ticker;
-    await call.save();
-
-    const curX = nowMc / entryMc;
-
-    // 1) normal ladder (e.g., 2/4/6/10)
-    for (const m of MILESTONES) {
-      const key = `x${m}`;
-      if (curX >= m && !call.milestonesHit[key]) {
-        call.milestonesHit[key] = true;
-        await call.save();
-        const next = MILESTONES.find((z) => z > m);
-        await postToChannel(formatMilestone(call, nowMc, curX, next));
+    for (const doc of docs) {
+      if (!doc.ca) {
+        console.log('skip: missing CA on doc', doc._id.toString());
+        continue;
       }
-    }
+      if (!doc.entryMc || doc.entryMc <= 0) {
+        // We need an entry marketcap to compute X
+        continue;
+      }
 
-    // 2) after 10x: integer-only alerts 10x, 11x, 12x, ...
-    if (curX >= 10) {
-      const intNow = Math.floor(curX);
-      for (let x = 10; x <= intNow; x++) {
-        const key = `int_${x}`;
-        if (!call.milestonesHit[key]) {
-          call.milestonesHit[key] = true;
-          await call.save();
-          await postToChannel(formatOver10x(call, nowMc));
+      // fetch latest price / mc
+      let info;
+      try {
+        info = await getTokenInfo(doc.ca);
+      } catch (e) {
+        console.log('tick error', doc.ticker, 'price unavailable');
+        continue;
+      }
+      if (!info || !info.mc) {
+        console.log('tick error', doc.ticker, 'price unavailable');
+        continue;
+      }
+
+      const nowMc = info.mc;
+      const peakMc = Math.max(doc.peakMc || 0, nowMc);
+      const nowX = nowMc / doc.entryMc;
+      const peakX = peakMc / doc.entryMc;
+
+      // Determine if we crossed a new milestone
+      const sentSet = new Set(doc.multipliersHit || []);
+      const milestone = nextMilestone(nowX, sentSet);
+
+      // Always update last/peak on every pass
+      let needSave = false;
+      if (doc.lastMc !== nowMc) {
+        doc.lastMc = nowMc;
+        needSave = true;
+      }
+      if (doc.peakMc !== peakMc) {
+        doc.peakMc = peakMc;
+        needSave = true;
+      }
+
+      if (milestone != null) {
+        // Compose alert
+        let text = '';
+        const tkr = doc.ticker ? `$${doc.ticker}` : 'Token';
+        const short = shortAddr(doc.ca, info.dex);
+        const user = doc.caller?.username || doc.caller?.tgId || 'caller';
+        const when = elapsedHM(doc.createdAt);
+
+        if (milestone >= 2 && milestone <= 8) {
+          // Rocket style (2x..8x)
+          const rockets = '🚀'.repeat(milestone * 2); // 2x -> 4 rockets, 4x -> 8 rockets…
+          text =
+            `${rockets} ${tkr} (${short}) hit ${nowX.toFixed(2)}× since call!\n\n` +
+            `Called at MC: ${usd(doc.entryMc)} by @${user}\n` +
+            `Now MC: ${usd(nowMc)}`;
+        } else if (milestone >= 10) {
+          // Moon style (10x+)
+          text =
+            `🌕${tkr} ${nowX.toFixed(2)}x (${peakX.toFixed(2)}x peak) | ` +
+            `💹From ${compactUsd(doc.entryMc)} ↗️ ${compactUsd(nowMc)} ` +
+            `within ${when}`;
+        }
+
+        try {
+          await tg.sendMessage(CH_ID, text, {
+            disable_web_page_preview: true,
+          });
+          // mark milestone as sent
+          sentSet.add(milestone);
+          doc.multipliersHit = Array.from(sentSet);
+          needSave = true;
+        } catch (e) {
+          console.error('send alert failed:', e.response?.description || e.message);
         }
       }
+
+      if (needSave) {
+        await doc.save();
+      }
     }
+  } catch (e) {
+    console.error('tick failed:', e);
   }
 }
 
-console.log("📡 Worker running…");
-tick().catch(console.error);
-setInterval(() => tick().catch(console.error), CHECK_MS);
+setInterval(tick, CHECK_MIN * 60 * 1000);
+tick();

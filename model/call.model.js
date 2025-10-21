@@ -1,33 +1,23 @@
 // model/call.model.js
-const mongoose = require("../model/db");
+const mongoose = require('mongoose');
 
 const CallSchema = new mongoose.Schema(
   {
-    // who
-    tgId: { type: String, index: true, required: true },
-    handle: { type: String },
-
-    // what
-    ca: { type: String, required: true, index: true }, // contract / mint
-    chain: { type: String, enum: ["sol", "bsc"], required: true },
-    ticker: { type: String, default: "" },
-
-    // prices / MC (USD)
-    entryPriceUsd: { type: Number, default: 0 },
-    entryMcUsd: { type: Number, default: 0 },
-
-    lastPriceUsd: { type: Number, default: 0 },
-    lastMcUsd: { type: Number, default: 0 },
-
-    peakMcUsd: { type: Number, default: 0 },
-
-    // milestones (flags); keys: 'x2','x4',... and 'int_10','int_11',... after 10x
-    milestonesHit: { type: Object, default: {} },
-
-    // housekeeping
-    startedAt: { type: Date, default: () => new Date() },
+    ca: { type: String, index: true, trim: true },          // SOL mint or BSC CA
+    chain: { type: String, enum: ['SOL', 'BSC'], index: true },
+    ticker: { type: String, trim: true },
+    entryMc: { type: Number, default: null },                // market cap at call time
+    peakMc: { type: Number, default: null },                 // highest seen mc
+    lastMc: { type: Number, default: null },                 // most recent mc
+    multipliersHit: { type: [Number], default: [] },         // [2,4,6,10, ...]
+    postedMessageId: { type: Number },                       // channel post id (for View link)
+    caller: {
+      tgId: { type: String, index: true },                   // store tgId as string
+      username: { type: String, trim: true },
+    },
+    createdAt: { type: Date, default: Date.now, index: true },
   },
   { timestamps: true }
 );
 
-module.exports = mongoose.model("Call", CallSchema);
+module.exports = mongoose.model('Call', CallSchema);
