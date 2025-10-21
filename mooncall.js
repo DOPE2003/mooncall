@@ -24,6 +24,7 @@ const SOON = '🚧 Available soon.';
 
 // --- helpers -----------------------------------------------------------------
 const cIdForPrivate = id => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
+
 function viewChannelButton(messageId) {
   if (!messageId) return Markup.inlineKeyboard([]);
   const shortId = cIdForPrivate(CH_ID);
@@ -50,6 +51,11 @@ const menuKeyboard = () =>
     [Markup.button.callback('🚀 Boost', 'cmd:boost')],
     [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
   ]);
+
+// Code-block helper: creates a message with Telegram's native "copy" affordance
+function sendCopyableCA(telegram, chatId, ca) {
+  return telegram.sendMessage(chatId, `<pre>${ca}</pre>`, { parse_mode: 'HTML' });
+}
 
 // --- UI: /start --------------------------------------------------------------
 bot.start(async ctx => {
@@ -157,7 +163,7 @@ bot.on('text', async ctx => {
     if (exists) return ctx.reply('You already made a call in the last 24h.');
   }
 
-  // fetch token info (must provide: ticker, name?, chain, mc, lp, vol24h, ageHours, imageUrl, chartUrl, dexName, tradeUrl)
+  // fetch token info (ticker, name?, chain, mc, lp, vol24h, ageHours, imageUrl, chartUrl, dexName, tradeUrl)
   let info;
   try {
     info = await getTokenInfo(caOrMint);
@@ -169,7 +175,7 @@ bot.on('text', async ctx => {
   const chartUrl = info.chartUrl || `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`;
   const tradeUrl = info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl;
 
-  // Compose caption EXACTLY as required (includes raw CA line)
+  // Caption with raw CA line (for exact requested layout)
   const caption = channelCardText({
     user: username,
     name: info.name,               // optional
@@ -183,7 +189,7 @@ bot.on('text', async ctx => {
     botUsername: BOT_USERNAME,
   });
 
-  // ---- Post to channel (image + caption WITH CA) ---------------------------
+  // ---- Post to channel (keep CA in the card) + send a copyable CA block ----
   let messageId;
   try {
     const kb = tradeKeyboards(info.chain, chartUrl, tradeUrl);
@@ -195,6 +201,9 @@ bot.on('text', async ctx => {
         ...kb,
       });
       messageId = res?.message_id;
+
+      // Add a second message with a code block for 1-tap copy
+      await sendCopyableCA(ctx.telegram, CH_ID, caOrMint);
     } else {
       const res = await ctx.telegram.sendMessage(CH_ID, caption, {
         parse_mode: 'HTML',
@@ -202,6 +211,9 @@ bot.on('text', async ctx => {
         ...kb,
       });
       messageId = res?.message_id;
+
+      // Add a second message with a code block for 1-tap copy
+      await sendCopyableCA(ctx.telegram, CH_ID, caOrMint);
     }
   } catch (e) {
     console.error('send to channel failed:', e.response?.description || e.message);
