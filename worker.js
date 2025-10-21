@@ -2,113 +2,130 @@
 require('dotenv').config();
 require('./lib/db');
 
-const Call = require('./model/call.model');
-const { getTokenInfo, usd } = require('./lib/price');
-const { Telegraf } = require('telegraf');
-const { lowTierAlertText, highTierAlertText, tradeKeyboards } = require('./card');
+const { Telegram } = require('telegraf');
+const tg = new Telegram(process.env.BOT_TOKEN);
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const Call = require('./model/call.model');
+const { getTokenInfo, usd, shortAddr } = require('./lib/price');
+
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
 
-// config
-const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 2);
+// how far back we keep tracking calls
 const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);
-const DRAW_ALERT = Number(process.env.DUMP_ALERT_DRAWDOWN || 0);
 
-// milestones: we’ll split 2–8 (low tier) & 10+ (high tier)
-const MILES = String(process.env.MILESTONES || '2,4,6,8,10')
-  .split(',')
-  .map((n) => Number(n.trim()))
-  .filter((n) => !isNaN(n) && n > 1)
-  .sort((a, b) => a - b);
+// how often we poll
+const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MINUTES || 1)) * 60_000;
 
-function minutes(ms) {
+// 2x..8x alerts (boss request)
+const LOW_MILES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
+  .split(',').map(n => Number(n.trim())).filter(n => n > 1 && n < 10).sort((a,b)=>a-b);
+
+// 10x+ alerts (post again at bigger round numbers)
+const HI_MILES = String(process.env.HI_MILESTONES || '10,12,15,20,25,30')
+  .split(',').map(n => Number(n.trim())).filter(n => n >= 10).sort((a,b)=>a-b);
+
+function formatDuration(ms) {
   const m = Math.floor(ms / 60000);
   const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return `${h}h:${String(mm).padStart(2, '0')}m`;
+  const min = m % 60;
+  return `${h}h:${String(min).padStart(2, '0')}m`;
+}
+
+function lowTierText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
+  const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
+  const tag = tkr ? `$${tkr}` : shortAddr(ca);
+  return (
+    `${rockets} ${tag} hit ${xNow.toFixed(2)}× since call!\n\n` +
+    `📞 Called at MC: ${usd(entryMc)} by @${byUser}\n` +
+    `🏆 Now MC: ${usd(nowMc)}`
+  );
+}
+
+function highTierText({ tkr, entryMc, nowMc, xNow, sinceMs }) {
+  // Example: 🌕 $CRK 11x | 💹From 66.1K ↗️ 300.6K within 2h:50m
+  const tag = tkr ? `$${tkr}` : 'Token';
+  return (
+    `🌕 ${tag} ${xNow.toFixed(2)}x | ` +
+    `💹From ${usd(entryMc).replace('$','')} ↗️ ${usd(nowMc).replace('$','')} ` +
+    `within ${formatDuration(sinceMs)}`
+  );
 }
 
 async function tick() {
-  const since = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
+  const createdSince = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
 
-  const calls = await Call.find({ createdAt: { $gte: since } }).lean();
+  // track recent calls only
+  const calls = await Call.find({ createdAt: { $gte: createdSince } }).limit(500);
 
   for (const c of calls) {
     try {
+      // Pull fresh MC (your getTokenInfo already talks to Dexscreener)
       const info = await getTokenInfo(c.ca);
       if (!info || !info.mc) continue;
 
+      const entry = Number(c.entryMc || 0);
+      if (!entry) continue; // can't compute X; ensure entryMc is set when saving a call
+
       const nowMc = info.mc;
-      const entryMc = c.entryMc || nowMc;
-      const peakMc = Math.max(c.peakMc || 0, nowMc);
-      const lastMc = nowMc;
+      const xNow = nowMc / entry;
 
-      // track peak
-      const $set = { lastMc, peakMc };
-
-      // drawdown alert (optional)
-      if (DRAW_ALERT > 0 && peakMc > 0) {
-        const dd = 100 * (peakMc - nowMc) / peakMc;
-        if (!c.dumpAlertSent && dd >= DRAW_ALERT) {
-          await bot.telegram.sendMessage(
-            CH_ID,
-            `⚠️ ${c.ticker ? '$' + c.ticker : 'Token'} drew down ${dd.toFixed(1)}% from peak.`,
-            { disable_web_page_preview: true }
-          );
-          $set.dumpAlertSent = true;
-        }
+      // update last & peak
+      const newPeak = Math.max(Number(c.peakMc || 0), nowMc);
+      if (newPeak !== c.peakMc || nowMc !== c.lastMc) {
+        await Call.updateOne(
+          { _id: c._id },
+          { $set: { lastMc: nowMc, peakMc: newPeak } }
+        );
       }
 
-      // milestones
-      const xNow = entryMc ? nowMc / entryMc : 1;
       const already = new Set(c.multipliersHit || []);
-      const toSend = MILES.filter((m) => xNow >= m && !already.has(m));
+      let changed = false;
 
-      for (const m of toSend) {
-        const byUser = c.caller?.username;
-        const duration = minutes(Date.now() - new Date(c.createdAt).getTime());
-        const kb = tradeKeyboards(c.chain, info.chartUrl);
-
-        let text;
-        if (m >= 10) {
-          text = highTierAlertText({
-            tkr: c.ticker,
-            entryMc,
-            nowMc,
-            xNow,
-            duration,
-          });
-        } else {
-          text = lowTierAlertText({
+      // 2x..8x alerts
+      for (const X of LOW_MILES) {
+        if (xNow >= X && !already.has(X)) {
+          const txt = lowTierText({
             tkr: c.ticker,
             ca: c.ca,
             xNow,
-            entryMc,
+            entryMc: entry,
             nowMc,
-            byUser,
+            byUser: c.caller?.username || c.caller?.tgId || 'user'
           });
+          await tg.sendMessage(CH_ID, txt, { parse_mode: 'HTML' });
+          already.add(X);
+          changed = true;
         }
-
-        await bot.telegram.sendMessage(CH_ID, text, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-          ...kb,
-        });
-
-        already.add(m);
       }
 
-      await Call.updateOne(
-        { _id: c._id },
-        { $set, $addToSet: { multipliersHit: { $each: Array.from(already) } } }
-      );
+      // 10x+ alerts
+      for (const X of HI_MILES) {
+        if (xNow >= X && !already.has(X)) {
+          const txt = highTierText({
+            tkr: c.ticker,
+            entryMc: entry,
+            nowMc,
+            xNow,
+            sinceMs: Date.now() - c.createdAt.getTime(),
+          });
+          await tg.sendMessage(CH_ID, txt, { parse_mode: 'HTML' });
+          already.add(X);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        await Call.updateOne(
+          { _id: c._id },
+          { $set: { multipliersHit: Array.from(already) } }
+        );
+      }
     } catch (e) {
-      console.error('tick error', e.message);
+      console.error('Worker error on', c.ca, e.message);
     }
   }
 }
 
 console.log('📡 Worker running…');
-setInterval(tick, CHECK_MIN * 60 * 1000);
-tick().catch((e) => console.error(e));
+setInterval(tick, INTERVAL_MS);
+tick();
