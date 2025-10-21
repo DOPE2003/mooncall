@@ -54,7 +54,7 @@ const menuKeyboard = () =>
 // --- UI: /start --------------------------------------------------------------
 bot.start(async ctx => {
   await ctx.reply(
-    'Welcome to Mooncall bot.\n\n' +
+    'Welcome to 🌖 Mooncall bot 🌖 .\n\n' +
       'Call tokens, track PnL, and compete for rewards.\n\n' +
       '» Each user can make 1 call per day\n' +
       '» Calls are tracked by PnL performance\n' +
