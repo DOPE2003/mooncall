@@ -1,8 +1,8 @@
 // card.js
-// Channel "New Call" card, PnL alert formatting, and inline keyboards.
+// Channel "New Call" card, inline keyboards, and alert text helpers.
 
 const { Markup } = require('telegraf');
-const { usd, shortAddr } = require('./lib/price');
+const { usd } = require('./lib/price');
 
 // Parse env list like: "📊 Axiom|https://t.me/axiom_app_bot,🐴 Trojan|https://..."
 function parseTradeBots(envVar) {
@@ -16,12 +16,19 @@ function parseTradeBots(envVar) {
     });
 }
 
+function safeDexLink(name, url) {
+  const dexName = name || 'DEX';
+  if (!url) return dexName;
+  // Keep it simple & safe in HTML mode
+  return `<a href="${url}">${dexName}</a>`;
+}
+
 /**
- * Inline keyboard below a channel post:
- *  - First row: Chart + Boost link
- *  - Next rows: bots pulled from env per chain
+ * Inline keyboard below a channel post.
+ * First row: Chart · Trade · Boost
+ * Next rows: bots from env (2 per row).
  */
-function tradeKeyboards(chain, chartUrl) {
+function tradeKeyboards(chain, chartUrl, tradeUrl) {
   const bots =
     chain === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
@@ -33,7 +40,8 @@ function tradeKeyboards(chain, chartUrl) {
   const rows = [
     [
       Markup.button.url('📈 Chart', chartUrl || 'https://dexscreener.com'),
-      Markup.button.url('Boost ⚡', boostUrl),
+      Markup.button.url('🌕 Trade', tradeUrl || chartUrl || 'https://dexscreener.com'),
+      Markup.button.url('🚀 Boost', boostUrl),
     ],
   ];
 
@@ -47,47 +55,51 @@ function tradeKeyboards(chain, chartUrl) {
   return Markup.inlineKeyboard(rows);
 }
 
-// ==== New-call post (caption/text) ====
-// Keep CA in the body; mooncall.js will (optionally) strip it out for photo caption
-// and send it as a separate code message for easy copying.
-function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
+/**
+ * Channel caption EXACTLY like the sample:
+ *  - New Call by @user
+ *  - NAME (DEX.LINK) ($TICKER)
+ *  - plain CA/mint (copyable by long-press)
+ *  - #CHAIN (DexName) | 🕓 age
+ *  - Stats
+ *  - UTC time line
+ *  - Make a call here 👉 @bot
+ */
+function channelCardText({
+  user,
+  name,            // token name (optional)
+  tkr,             // ticker without $, e.g. BDTCH
+  chain,           // SOL / BSC
+  mintOrCa,        // raw CA/mint
+  stats,           // { mc, lp, vol24h }
+  ageHours,        // number
+  dexName,         // e.g. PIGEON.TRADE
+  dexUrl,          // link for the DEX name
+  botUsername,     // e.g. mooncal_bot (no @)
+}) {
   const age = ageHours != null ? `${ageHours}h old` : '—';
+  const dexLabel = dexName || 'dex';
+  const dexDisplay = safeDexLink(dexLabel, dexUrl);
+  const tickerText = tkr ? `($${tkr})` : '';
+  const tokenTitle = `${name || (tkr ? `$${tkr}` : 'Token')} ${tickerText}`.trim();
+
+  const utcNow = new Date().toUTCString();
+
   return (
     `New Call by @${user}\n\n` +
-    `${tkr ? `$${tkr}` : 'Token'} (${chain})\n\n` +
+    `${tokenTitle.replace(/\s+\(\$[^)]+\)$/, '')} (${dexDisplay}) ${tickerText}\n\n` +
     `${mintOrCa}\n\n` +
-    `#${chain} (${dex}) | 🕓 ${age}\n\n` +
+    `#${chain} (${dexLabel}) | 🕓 ${age}\n\n` +
     `📊 <b>Stats</b>\n` +
-    `• MC when called: ${usd(stats.mc)}\n` +
+    `• MC: ${usd(stats.mc)}\n` +
     `• LP: ${stats.lp != null ? usd(stats.lp) : '—'}\n` +
-    `• 24h Vol: ${usd(stats.vol24h)}`
-  );
-}
-
-// ==== PnL alerts (2×–8×) ====
-function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
-  const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
-  const tag = tkr ? `$${tkr}` : shortAddr(ca);
-  return (
-    `${rockets} ${tag} hit ${xNow.toFixed(2)}× since call!\n\n` +
-    `📞 Called at MC: ${usd(entryMc)}${byUser ? ` by @${byUser}` : ''}\n` +
-    `🏆 Now MC: ${usd(nowMc)}`
-  );
-}
-
-// ==== PnL alerts (10×+) ====
-function highTierAlertText({ tkr, entryMc, nowMc, xNow, duration }) {
-  const tag = tkr ? `$${tkr}` : 'Token';
-  const durLabel = duration || '—';
-  return (
-    `🌕 ${tag} ${xNow.toFixed(2)}x | 💹From ${usd(entryMc).replace('$', '')} ` +
-    `↗️ ${usd(nowMc).replace('$', '')} within ${durLabel}`
+    `• 24h Vol: ${usd(stats.vol24h)}\n\n` +
+    `${utcNow}\n\n` +
+    `Make a call here 👉 @${botUsername}`
   );
 }
 
 module.exports = {
-  channelCardText,
   tradeKeyboards,
-  lowTierAlertText,
-  highTierAlertText,
+  channelCardText,
 };

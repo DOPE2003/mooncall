@@ -17,8 +17,7 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
 
 const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
-const WANT_IMAGE =
-  String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
+const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
 const isAdmin = tgId => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
@@ -70,7 +69,7 @@ bot.start(async ctx => {
   );
 });
 
-// --- Simple media guard (we only accept text addresses) ----------------------
+// --- Simple media guard ------------------------------------------------------
 ['photo', 'document', 'video', 'audio', 'sticker', 'voice'].forEach(type =>
   bot.on(type, ctx => ctx.reply('This bot only accepts text token addresses.'))
 );
@@ -89,35 +88,16 @@ bot.action('cmd:subscribe', async ctx => (await ctx.answerCbQuery(), ctx.reply(S
 bot.action('cmd:boost', async ctx => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 bot.action('cmd:boosted', async ctx => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 
-// --- Top Callers: sum of X across all calls (peak/entry) ---------------------
+// --- Top Callers: Σ(peak/entry) per user, medals for top 3 -------------------
 bot.action('cmd:leaders', async ctx => {
   try {
     await ctx.answerCbQuery();
 
-    // sumX = Σ(peakMc / entryMc) per caller
     const rows = await Call.aggregate([
-      {
-        $project: {
-          user: '$caller.username',
-          tgId: '$caller.tgId',
-          entry: '$entryMc',
-          peak: '$peakMc',
-        },
-      },
+      { $project: { user: '$caller.username', tgId: '$caller.tgId', entry: '$entryMc', peak: '$peakMc' } },
       { $match: { entry: { $gt: 0 }, peak: { $gt: 0 } } },
-      {
-        $project: {
-          user: 1,
-          tgId: 1,
-          x: { $divide: ['$peak', '$entry'] },
-        },
-      },
-      {
-        $group: {
-          _id: { user: '$user', tgId: '$tgId' },
-          sumX: { $sum: '$x' },
-        },
-      },
+      { $project: { user: 1, tgId: 1, x: { $divide: ['$peak', '$entry'] } } },
+      { $group: { _id: { user: '$user', tgId: '$tgId' }, sumX: { $sum: '$x' } } },
       { $sort: { sumX: -1 } },
       { $limit: 10 },
     ]);
@@ -143,6 +123,7 @@ bot.action('cmd:mycalls', async ctx => {
     await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
     const list = await Call.find({ 'caller.tgId': tgId }).sort({ createdAt: -1 }).limit(10);
+
     if (!list.length) return ctx.reply('You have no calls yet.');
 
     const lines = list.map(c => {
@@ -161,13 +142,13 @@ bot.action('cmd:mycalls', async ctx => {
   }
 });
 
-// --- Token input flow (plain text) -------------------------------------------
+// --- Token input flow --------------------------------------------------------
 bot.on('text', async ctx => {
   const caOrMint = (ctx.message?.text || '').trim();
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
 
-  if (!isSolMint(caOrMint) && !isBsc(caOrMint)) return; // ignore unrelated messages
+  if (!isSolMint(caOrMint) && !isBsc(caOrMint)) return;
 
   // one call per 24h unless admin
   const since = new Date(Date.now() - 24 * 3600 * 1000);
@@ -176,7 +157,7 @@ bot.on('text', async ctx => {
     if (exists) return ctx.reply('You already made a call in the last 24h.');
   }
 
-  // fetch token info
+  // fetch token info (must provide: ticker, name?, chain, mc, lp, vol24h, ageHours, imageUrl, chartUrl, dexName, tradeUrl)
   let info;
   try {
     info = await getTokenInfo(caOrMint);
@@ -186,25 +167,28 @@ bot.on('text', async ctx => {
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
   const chartUrl = info.chartUrl || `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`;
+  const tradeUrl = info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl;
 
-  // Compose card body (CA/mint INCLUDED in caption for copyability)
+  // Compose caption EXACTLY as required (includes raw CA line)
   const caption = channelCardText({
     user: username,
-    tkr: info.ticker || 'Token',
+    name: info.name,               // optional
+    tkr: info.ticker || '',
     chain: info.chain,
     mintOrCa: caOrMint,
     stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
     ageHours: info.ageHours,
-    dex: info.dex || 'dex',
+    dexName: info.dex || 'DEX',
+    dexUrl: tradeUrl,
+    botUsername: BOT_USERNAME,
   });
 
-  // ---- Post to channel (image: caption keeps CA line) -----------------------
+  // ---- Post to channel (image + caption WITH CA) ---------------------------
   let messageId;
   try {
-    const kb = tradeKeyboards(info.chain, chartUrl);
+    const kb = tradeKeyboards(info.chain, chartUrl, tradeUrl);
 
     if (WANT_IMAGE && info.imageUrl) {
-      // CA remains inside caption — copyable in the card like the reference
       const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
         caption,
         parse_mode: 'HTML',
@@ -252,12 +236,11 @@ bot.catch((err, ctx) => {
 
 (async () => {
   try {
-    // One-instance safety: allow disabling local polling while Render runs
+    // Avoid 409 conflicts: set DISABLE_BOT_LAUNCH=1 locally when Render is live.
     if (process.env.DISABLE_BOT_LAUNCH === '1') {
       console.log('Bot launch disabled by env (DISABLE_BOT_LAUNCH=1).');
       return;
     }
-
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     await bot.launch({ dropPendingUpdates: true });
     console.log('🤖 mooncall bot ready');
