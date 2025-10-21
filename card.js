@@ -8,10 +8,10 @@ const { usd, shortAddr } = require('./lib/price');
 function parseTradeBots(envVar) {
   return String(envVar || '')
     .split(',')
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean)
-    .map(s => {
-      const [label, url] = s.split('|').map(x => x.trim());
+    .map((s) => {
+      const [label, url] = s.split('|').map((x) => x.trim());
       return { label: label || 'Bot', url: url || 'https://t.me' };
     });
 }
@@ -48,13 +48,13 @@ function tradeKeyboards(chain, chartUrl) {
 }
 
 // ==== New-call post (caption/text) ====
-// Keep CA plain so it’s easy to select/copy in Telegram.
+// Keep CA copyable; <code>…</code> prevents Telegram from auto-linking it.
 function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
   const age = ageHours != null ? `${ageHours}h old` : '—';
   return (
     `New Call by @${user}\n\n` +
     `${tkr ? `$${tkr}` : 'Token'} (${chain})\n\n` +
-    `${mintOrCa}\n\n` +
+    `<code>${mintOrCa}</code>\n\n` +
     `#${chain} (${dex}) | 🕓 ${age}\n\n` +
     `📊 <b>Stats</b>\n` +
     `• MC when called: ${usd(stats.mc)}\n` +
@@ -64,7 +64,7 @@ function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
 }
 
 // ==== PnL alerts (2×–8×) ====
-// Example target format (boss request):
+// Example target format:
 // 🚀🚀🚀🚀 $SOLEYES (DV2C…pump) hit 2.08× since call!
 // Called at MC: $25,546 by @German_arc
 // Now MC: $53,060
@@ -79,7 +79,7 @@ function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
 }
 
 // ==== PnL alerts (10×+) ====
-// Example target format (boss request):
+// Example target format:
 // 🌕 $CRK 11x | 💹From 66.1K ↗️ 300.6K within 2h:50m
 function highTierAlertText({ tkr, entryMc, nowMc, xNow, duration }) {
   const tag = tkr ? `$${tkr}` : 'Token';

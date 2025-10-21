@@ -253,7 +253,7 @@ bot.on('text', async (ctx) => {
     '✅ <b>Call saved!</b>\n' +
       `Token: ${info.ticker || info.chain}\n` +
       `Called MC: ${usd(info.mc)}\n` +
-      "We’ll track it & alert milestones.",
+      'We’ll track it & alert milestones.',
     { parse_mode: 'HTML', ...viewChannelButton(messageId) }
   );
 });
