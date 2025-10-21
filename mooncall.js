@@ -17,13 +17,14 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
 
 const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
+const WANT_IMAGE =
+  String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
 const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
 // --- helpers -----------------------------------------------------------------
 const cIdForPrivate = (id) => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
-
 function viewChannelButton(messageId) {
   if (!messageId) return Markup.inlineKeyboard([]);
   const shortId = cIdForPrivate(CH_ID);
@@ -83,7 +84,7 @@ bot.action('cmd:rules', async (ctx) => {
 
 bot.action('cmd:make', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('Paste the token address (SOL or BSC ).');
+  await ctx.reply('Paste the token address (SOL or BSC).');
 });
 
 bot.action('cmd:community', async (ctx) => {
@@ -108,7 +109,7 @@ bot.action('cmd:leaders', async (ctx) => {
   try {
     await ctx.answerCbQuery();
 
-    // We compute sumX = Σ(peakMc / entryMc) for each caller
+    // sumX = Σ(peakMc / entryMc) per caller
     const rows = await Call.aggregate([
       {
         $project: {
@@ -201,31 +202,42 @@ bot.on('text', async (ctx) => {
   }
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
-  // Post to channel
+  // Compose body
   const body = channelCardText({
     user: username,
     tkr: info.ticker ? `${info.ticker}` : 'Token',
     chain: info.chain,
-    mintOrCa: text, // raw so it’s copyable in channel
+    mintOrCa: text, // keep raw so it’s copyable in channel
     stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
     ageHours: info.ageHours,
     dex: info.dex,
   });
 
+  // Post to channel (image caption if available & allowed)
   let messageId;
   try {
-    const res = await ctx.telegram.sendMessage(CH_ID, body, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: false,
-      ...tradeKeyboards(info.chain),
-    });
-    messageId = res?.message_id;
+    const kb = tradeKeyboards(info.chain, info.chartUrl);
+    if (WANT_IMAGE && info.imageUrl) {
+      const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
+        caption: body,
+        parse_mode: 'HTML',
+        ...kb,
+      });
+      messageId = res?.message_id;
+    } else {
+      const res = await ctx.telegram.sendMessage(CH_ID, body, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: false,
+        ...kb,
+      });
+      messageId = res?.message_id;
+    }
   } catch (e) {
     console.error('send to channel failed:', e.response?.description || e.message);
   }
 
   // Save call
-  const doc = await Call.create({
+  await Call.create({
     ca: text,
     chain: info.chain,
     ticker: info.ticker || undefined,

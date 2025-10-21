@@ -3,102 +3,112 @@ require('dotenv').config();
 require('./lib/db');
 
 const Call = require('./model/call.model');
-const { Telegraf } = require('telegraf');
 const { getTokenInfo, usd } = require('./lib/price');
+const { Telegraf } = require('telegraf');
 const { lowTierAlertText, highTierAlertText, tradeKeyboards } = require('./card');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
 
-// milestones: 2..8 (styled as “Chart/Boost”), and integers ≥10 with moon style
-const BASE_MILESTONES = [2,3,4,5,6,7,8,10];
+// config
+const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 2);
+const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);
+const DRAW_ALERT = Number(process.env.DUMP_ALERT_DRAWDOWN || 0);
 
-function humanDuration(ms) {
-  if (ms <= 0) return '—';
-  const h = Math.floor(ms / 36e5);
-  const m = Math.floor((ms % 36e5) / 60000);
-  if (h === 0) return `${m}m`;
-  return `${h}h:${String(m).padStart(2, '0')}m`;
-}
+// milestones: we’ll split 2–8 (low tier) & 10+ (high tier)
+const MILES = String(process.env.MILESTONES || '2,4,6,8,10')
+  .split(',')
+  .map((n) => Number(n.trim()))
+  .filter((n) => !isNaN(n) && n > 1)
+  .sort((a, b) => a - b);
 
-async function postLowTier(call, info, xNow) {
-  const text = lowTierAlertText({
-    tkr: call.ticker,
-    ca: call.ca,
-    xNow,
-    entryMc: call.entryMc,
-    nowMc: call.lastMc,
-    byUser: call.caller?.username,
-  });
-  await bot.telegram.sendMessage(CH_ID, text, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...tradeKeyboards(call.chain, info?.chartUrl),
-  });
-}
-
-async function postHighTier(call, info, xNow) {
-  const sinceMs = Date.now() - new Date(call.createdAt).getTime();
-  const text = highTierAlertText({
-    tkr: call.ticker,
-    entryMc: call.entryMc,
-    nowMc: call.lastMc,
-    xNow,
-    duration: humanDuration(sinceMs),
-  });
-  await bot.telegram.sendMessage(CH_ID, text, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...tradeKeyboards(call.chain, info?.chartUrl),
-  });
+function minutes(ms) {
+  const m = Math.floor(ms / 60000);
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h:${String(mm).padStart(2, '0')}m`;
 }
 
 async function tick() {
-  const calls = await Call.find({ entryMc: { $gt: 0 } }).limit(500);
+  const since = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
+
+  const calls = await Call.find({ createdAt: { $gte: since } }).lean();
 
   for (const c of calls) {
-    let info;
-    try { info = await getTokenInfo(c.ca); } catch {}
+    try {
+      const info = await getTokenInfo(c.ca);
+      if (!info || !info.mc) continue;
 
-    const mc = info?.mc || null;
-    if (!mc) continue;
+      const nowMc = info.mc;
+      const entryMc = c.entryMc || nowMc;
+      const peakMc = Math.max(c.peakMc || 0, nowMc);
+      const lastMc = nowMc;
 
-    c.lastMc = mc;
-    if (mc > (c.peakMc || 0)) c.peakMc = mc;
+      // track peak
+      const $set = { lastMc, peakMc };
 
-    const xNow = c.entryMc > 0 ? mc / c.entryMc : 0;
-
-    // Decide which threshold(s) to fire
-    const hitSet = new Set(c.multipliersHit || []);
-
-    // integers >=10
-    if (xNow >= 10) {
-      const k = Math.floor(xNow);
-      if (!hitSet.has(k)) {
-        await postHighTier(c, info, xNow);
-        hitSet.add(k);
-      }
-    } else {
-      // 2..8 with low-tier format
-      for (const m of BASE_MILESTONES) {
-        if (m >= 10) continue;
-        if (xNow >= m && !hitSet.has(m)) {
-          await postLowTier(c, info, xNow);
-          hitSet.add(m);
+      // drawdown alert (optional)
+      if (DRAW_ALERT > 0 && peakMc > 0) {
+        const dd = 100 * (peakMc - nowMc) / peakMc;
+        if (!c.dumpAlertSent && dd >= DRAW_ALERT) {
+          await bot.telegram.sendMessage(
+            CH_ID,
+            `⚠️ ${c.ticker ? '$' + c.ticker : 'Token'} drew down ${dd.toFixed(1)}% from peak.`,
+            { disable_web_page_preview: true }
+          );
+          $set.dumpAlertSent = true;
         }
       }
-    }
 
-    c.multipliersHit = Array.from(hitSet).sort((a,b) => a-b);
-    await c.save();
+      // milestones
+      const xNow = entryMc ? nowMc / entryMc : 1;
+      const already = new Set(c.multipliersHit || []);
+      const toSend = MILES.filter((m) => xNow >= m && !already.has(m));
+
+      for (const m of toSend) {
+        const byUser = c.caller?.username;
+        const duration = minutes(Date.now() - new Date(c.createdAt).getTime());
+        const kb = tradeKeyboards(c.chain, info.chartUrl);
+
+        let text;
+        if (m >= 10) {
+          text = highTierAlertText({
+            tkr: c.ticker,
+            entryMc,
+            nowMc,
+            xNow,
+            duration,
+          });
+        } else {
+          text = lowTierAlertText({
+            tkr: c.ticker,
+            ca: c.ca,
+            xNow,
+            entryMc,
+            nowMc,
+            byUser,
+          });
+        }
+
+        await bot.telegram.sendMessage(CH_ID, text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...kb,
+        });
+
+        already.add(m);
+      }
+
+      await Call.updateOne(
+        { _id: c._id },
+        { $set, $addToSet: { multipliersHit: { $each: Array.from(already) } } }
+      );
+    } catch (e) {
+      console.error('tick error', e.message);
+    }
   }
 }
 
-async function main() {
-  console.log('📡 Worker running…');
-  await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-  // no polling here; just use telegram client to send messages
-  setInterval(tick, Math.max(1, Number(process.env.CHECK_INTERVAL_MINUTES || 5)) * 60 * 1000);
-  await tick(); // run once at boot
-}
-main().catch(e => console.error(e));
+console.log('📡 Worker running…');
+setInterval(tick, CHECK_MIN * 60 * 1000);
+tick().catch((e) => console.error(e));

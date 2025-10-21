@@ -1,5 +1,6 @@
 // card.js
-// Channel "New Call" card, alert formatting, and inline keyboards.
+// Channel "New Call" card, PnL alert formatting, and inline keyboards.
+
 const { Markup } = require('telegraf');
 const { usd, shortAddr } = require('./lib/price');
 
@@ -15,13 +16,20 @@ function parseTradeBots(envVar) {
     });
 }
 
+/**
+ * Inline keyboard below a channel post:
+ *  - First row: Chart + Boost link
+ *  - Next rows: bots pulled from env per chain
+ */
 function tradeKeyboards(chain, chartUrl) {
   const bots =
     chain === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
       : parseTradeBots(process.env.TRADE_BOTS_BSC);
 
-  const boostUrl = process.env.BOOST_URL || process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
+  const boostUrl =
+    process.env.BOOST_URL || process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
+
   const rows = [
     [
       Markup.button.url('📈 Chart', chartUrl || 'https://dexscreener.com'),
@@ -40,38 +48,43 @@ function tradeKeyboards(chain, chartUrl) {
 }
 
 // ==== New-call post (caption/text) ====
+// Keep CA plain so it’s easy to select/copy in Telegram.
 function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
   const age = ageHours != null ? `${ageHours}h old` : '—';
-  const caLine = `${mintOrCa}`; // copyable
   return (
     `New Call by @${user}\n\n` +
     `${tkr ? `$${tkr}` : 'Token'} (${chain})\n\n` +
-    `${caLine}\n\n` +
+    `${mintOrCa}\n\n` +
     `#${chain} (${dex}) | 🕓 ${age}\n\n` +
     `📊 <b>Stats</b>\n` +
     `• MC when called: ${usd(stats.mc)}\n` +
-    `• LP: ${usd(stats.lp)}\n` +
+    `• LP: ${stats.lp != null ? usd(stats.lp) : '—'}\n` +
     `• 24h Vol: ${usd(stats.vol24h)}`
   );
 }
 
 // ==== PnL alerts (2×–8×) ====
+// Example target format (boss request):
+// 🚀🚀🚀🚀 $SOLEYES (DV2C…pump) hit 2.08× since call!
+// Called at MC: $25,546 by @German_arc
+// Now MC: $53,060
 function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
-  // rockets: 2x → 4 rockets, 8x → 12 rockets (capped)
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
   const tag = tkr ? `$${tkr}` : shortAddr(ca);
   return (
-    `${rockets} ${tag} soared by X${xNow.toFixed(2)} since was called!\n\n` +
-    `📞 MC when called: ${usd(entryMc)}${byUser ? ` by @${byUser}` : ''}\n` +
-    `🏆 MC now: ${usd(nowMc)}`
+    `${rockets} ${tag} hit ${xNow.toFixed(2)}× since call!\n\n` +
+    `📞 Called at MC: ${usd(entryMc)}${byUser ? ` by @${byUser}` : ''}\n` +
+    `🏆 Now MC: ${usd(nowMc)}`
   );
 }
 
 // ==== PnL alerts (10×+) ====
+// Example target format (boss request):
+// 🌕 $CRK 11x | 💹From 66.1K ↗️ 300.6K within 2h:50m
 function highTierAlertText({ tkr, entryMc, nowMc, xNow, duration }) {
-  // 🌕 $CRK 11x | 💹From 66.1K ↗️ 300.6K within 2h:50m
   const tag = tkr ? `$${tkr}` : 'Token';
   const durLabel = duration || '—';
+  // Remove $ sign in “From/To” per requested look
   return (
     `🌕 ${tag} ${xNow.toFixed(2)}x | 💹From ${usd(entryMc).replace('$', '')} ` +
     `↗️ ${usd(nowMc).replace('$', '')} within ${durLabel}`
