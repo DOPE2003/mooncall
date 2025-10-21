@@ -16,6 +16,11 @@ function parseTradeBots(envVar) {
     });
 }
 
+/**
+ * Inline keyboard below a channel post:
+ *  - First row: Chart + Boost link
+ *  - Next rows: bots pulled from env per chain
+ */
 function tradeKeyboards(chain, chartUrl) {
   const bots =
     chain === 'SOL'
@@ -42,7 +47,9 @@ function tradeKeyboards(chain, chartUrl) {
   return Markup.inlineKeyboard(rows);
 }
 
-// Keep CA/mint plain text so it’s easy to select/copy in Telegram.
+// ==== New-call post (caption/text) ====
+// Keep CA in the body; mooncall.js will (optionally) strip it out for photo caption
+// and send it as a separate code message for easy copying.
 function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
   const age = ageHours != null ? `${ageHours}h old` : '—';
   return (
@@ -57,7 +64,7 @@ function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
   );
 }
 
-// Alerts
+// ==== PnL alerts (2×–8×) ====
 function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
   const tag = tkr ? `$${tkr}` : shortAddr(ca);
@@ -68,6 +75,7 @@ function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
   );
 }
 
+// ==== PnL alerts (10×+) ====
 function highTierAlertText({ tkr, entryMc, nowMc, xNow, duration }) {
   const tag = tkr ? `$${tkr}` : 'Token';
   const durLabel = duration || '—';

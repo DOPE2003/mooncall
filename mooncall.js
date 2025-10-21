@@ -7,19 +7,23 @@ const Call = require('./model/call.model');
 const { getTokenInfo, isSolMint, isBsc, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
 
+// --- env / constants ---------------------------------------------------------
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
-  .split(',').map(x => x.trim()).filter(Boolean);
+  .split(',')
+  .map(x => x.trim())
+  .filter(Boolean);
 
 const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
-const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
-
-const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
+const WANT_IMAGE =
+  String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
+const isAdmin = tgId => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
-const cIdForPrivate = (id) => String(id).replace('-100', '');
+// --- helpers -----------------------------------------------------------------
+const cIdForPrivate = id => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
 function viewChannelButton(messageId) {
   if (!messageId) return Markup.inlineKeyboard([]);
   const shortId = cIdForPrivate(CH_ID);
@@ -47,33 +51,8 @@ const menuKeyboard = () =>
     [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
   ]);
 
-// --------- robust mint/CA extraction ----------------------------------------
-const RX_BASE58_WIDE = /[1-9A-HJ-NP-Za-km-z]{25,64}/;
-
-function extractMintOrCa(input) {
-  let s = String(input || '');
-
-  // strip spaces and zero-width chars
-  s = s.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-
-  // handle full pump.fun URLs or trailing “pump”
-  s = s
-    .replace(/https?:\/\/(www\.)?pump\.fun\/coin\/([A-Za-z0-9]+)/i, '$2')
-    .replace(/pump$/i, '');
-
-  // pick 0x CA first
-  const bsc = s.match(/0x[a-fA-F0-9]{40}/);
-  if (bsc) return bsc[0];
-
-  // or a (relaxed) base58 mint
-  const m = s.match(RX_BASE58_WIDE);
-  if (m) return m[0];
-
-  return s.trim();
-}
-
-// ---------------- /start & buttons ------------------------------------------
-bot.start(async (ctx) => {
+// --- UI: /start --------------------------------------------------------------
+bot.start(async ctx => {
   await ctx.reply(
     'Welcome to Mooncall bot.\n\n' +
       'Call tokens, track PnL, and compete for rewards.\n\n' +
@@ -90,120 +69,172 @@ bot.start(async (ctx) => {
   );
 });
 
-['photo','document','video','audio','sticker','voice'].forEach(type =>
-  bot.on(type, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
+// --- Simple media guard (we only accept text addresses) ----------------------
+['photo', 'document', 'video', 'audio', 'sticker', 'voice'].forEach(type =>
+  bot.on(type, ctx => ctx.reply('This bot only accepts text token addresses.'))
 );
 
-bot.action('cmd:rules', async (ctx) => { await ctx.answerCbQuery(); await ctx.reply(rulesText, { parse_mode: 'HTML' }); });
-bot.action('cmd:make',  async (ctx) => { await ctx.answerCbQuery(); await ctx.reply('Paste the token address (SOL or BSC).'); });
-bot.action('cmd:community', async (ctx)=>{ await ctx.answerCbQuery(); await ctx.reply(SOON); });
-bot.action('cmd:subscribe', async (ctx)=>{ await ctx.answerCbQuery(); await ctx.reply(SOON); });
-bot.action('cmd:boost', async (ctx)=>{ await ctx.answerCbQuery(); await ctx.reply(SOON); });
-bot.action('cmd:boosted', async (ctx)=>{ await ctx.answerCbQuery(); await ctx.reply(SOON); });
+// --- Buttons -----------------------------------------------------------------
+bot.action('cmd:rules', async ctx => {
+  await ctx.answerCbQuery();
+  await ctx.reply(rulesText, { parse_mode: 'HTML' });
+});
+bot.action('cmd:make', async ctx => {
+  await ctx.answerCbQuery();
+  await ctx.reply('Paste the token address (SOL or BSC).');
+});
+bot.action('cmd:community', async ctx => (await ctx.answerCbQuery(), ctx.reply(SOON)));
+bot.action('cmd:subscribe', async ctx => (await ctx.answerCbQuery(), ctx.reply(SOON)));
+bot.action('cmd:boost', async ctx => (await ctx.answerCbQuery(), ctx.reply(SOON)));
+bot.action('cmd:boosted', async ctx => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 
-// --------------- leaderboard (sum of X) --------------------------------------
-bot.action('cmd:leaders', async (ctx) => {
+// --- Top Callers: sum of X across all calls (peak/entry) ---------------------
+bot.action('cmd:leaders', async ctx => {
   try {
     await ctx.answerCbQuery();
+
+    // sumX = Σ(peakMc / entryMc) per caller
     const rows = await Call.aggregate([
-      { $project: { user:'$caller.username', tgId:'$caller.tgId', entry:'$entryMc', peak:'$peakMc' } },
-      { $match:   { entry: { $gt: 0 }, peak: { $gt: 0 } } },
-      { $project: { user:1, tgId:1, x: { $divide: ['$peak', '$entry'] } } },
-      { $group:   { _id: { user:'$user', tgId:'$tgId' }, sumX: { $sum: '$x' } } },
-      { $sort:    { sumX: -1 } },
-      { $limit:   10 }
+      {
+        $project: {
+          user: '$caller.username',
+          tgId: '$caller.tgId',
+          entry: '$entryMc',
+          peak: '$peakMc',
+        },
+      },
+      { $match: { entry: { $gt: 0 }, peak: { $gt: 0 } } },
+      {
+        $project: {
+          user: 1,
+          tgId: 1,
+          x: { $divide: ['$peak', '$entry'] },
+        },
+      },
+      {
+        $group: {
+          _id: { user: '$user', tgId: '$tgId' },
+          sumX: { $sum: '$x' },
+        },
+      },
+      { $sort: { sumX: -1 } },
+      { $limit: 10 },
     ]);
+
     if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
-    const medal = (i)=> (i===0?'🥇':i===1?'🥈':i===2?'🥉':`${i+1}.`);
-    const lines = rows.map((r,i)=>`${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
+
+    const medal = i => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
+    const lines = rows.map((r, i) => {
+      const handle = r._id.user || r._id.tgId;
+      return `${medal(i)} @${handle} — ${r.sumX.toFixed(2)}× total`;
+    });
+
     await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) {
-    console.error(e); await ctx.reply('Failed to load leaderboard.');
+    console.error(e);
+    await ctx.reply('Failed to load leaderboard.');
   }
 });
 
-// --------------- my calls ----------------------------------------------------
-bot.action('cmd:mycalls', async (ctx) => {
+// --- My calls ----------------------------------------------------------------
+bot.action('cmd:mycalls', async ctx => {
   try {
     await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
     const list = await Call.find({ 'caller.tgId': tgId }).sort({ createdAt: -1 }).limit(10);
     if (!list.length) return ctx.reply('You have no calls yet.');
+
     const lines = list.map(c => {
-      const entry = usd(c.entryMc), now = usd(c.lastMc), tkr = c.ticker ? `$${c.ticker}` : '—';
+      const entry = usd(c.entryMc);
+      const now = usd(c.lastMc);
+      const tkr = c.ticker ? `$${c.ticker}` : '—';
       return `• ${tkr}\n   MC when called: ${entry}\n   MC now: ${now}`;
     });
-    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode: 'HTML' });
-  } catch (e) { console.error(e); }
+
+    await ctx.reply(
+      `🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) {
+    console.error(e);
+  }
 });
 
-// --------------- token input -------------------------------------------------
-bot.on('text', async (ctx) => {
-  const raw = (ctx.message?.text || '').trim();
-  const caOrMint = extractMintOrCa(raw);
+// --- Token input flow (plain text) -------------------------------------------
+bot.on('text', async ctx => {
+  const caOrMint = (ctx.message?.text || '').trim();
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
 
-  // Allow anything we could extract; hard validation often blocks real mints
-  if (!isSolMint(caOrMint) && !isBsc(caOrMint)) {
-    // Not obviously a CA/mint; ignore quietly
-    return;
-  }
+  if (!isSolMint(caOrMint) && !isBsc(caOrMint)) return; // ignore unrelated messages
 
-  // throttle (except admins)
+  // one call per 24h unless admin
   const since = new Date(Date.now() - 24 * 3600 * 1000);
   if (!isAdmin(tgId)) {
     const exists = await Call.exists({ 'caller.tgId': tgId, createdAt: { $gte: since } });
     if (exists) return ctx.reply('You already made a call in the last 24h.');
   }
 
-  // Fetch data
-  let info = null;
+  // fetch token info
+  let info;
   try {
     info = await getTokenInfo(caOrMint);
   } catch (e) {
-    console.error('getTokenInfo error:', e);
+    console.error('price fetch failed:', e.message);
   }
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
-  // image fallbacks
-  if (!info.imageUrl && info.chain === 'SOL') {
-    info.imageUrl = `https://cdn.pump.fun/token/${caOrMint}.png`;
-  }
-  if (!info.imageUrl && info.chain === 'BSC' && caOrMint.startsWith('0x')) {
-    info.imageUrl = `https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/smartchain/assets/${caOrMint}/logo.png`;
-  }
+  const chartUrl = info.chartUrl || `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`;
 
-  const chartUrl =
-    info.chartUrl ||
-    (info.chain === 'SOL'
-      ? `https://dexscreener.com/solana/${caOrMint}`
-      : `https://dexscreener.com/bsc/${caOrMint}`);
-
-  const body = channelCardText({
+  // Compose card body (includes CA line)
+  const fullCaption = channelCardText({
     user: username,
     tkr: info.ticker || 'Token',
     chain: info.chain,
-    mintOrCa: caOrMint,              // stays plain — copyable
+    mintOrCa: caOrMint,
     stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
     ageHours: info.ageHours,
     dex: info.dex || 'dex',
   });
 
-  // Post to channel (+image when possible)
+  // ---- Post to channel (image + separate, copyable CA) ---------------------
   let messageId;
   try {
     const kb = tradeKeyboards(info.chain, chartUrl);
+
+    // For photos, caption selection can be awkward. Strip the CA from caption and
+    // post it in a second monospace message for easy copying.
+    const captionWithoutCA = fullCaption.replace(`${caOrMint}\n\n`, '');
+
     if (WANT_IMAGE && info.imageUrl) {
       try {
-        const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, { caption: body, parse_mode: 'HTML', ...kb });
+        const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
+          caption: captionWithoutCA,
+          parse_mode: 'HTML',
+          ...kb,
+        });
         messageId = res?.message_id;
+
+        // post a separate copy-only CA right under the image
+        await ctx.telegram.sendMessage(CH_ID, `<code>${caOrMint}</code>`, {
+          parse_mode: 'HTML',
+        });
       } catch (_) {
-        const res = await ctx.telegram.sendMessage(CH_ID, body, { parse_mode: 'HTML', disable_web_page_preview: false, ...kb });
+        // fallback to text
+        const res = await ctx.telegram.sendMessage(CH_ID, fullCaption, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: false,
+          ...kb,
+        });
         messageId = res?.message_id;
       }
     } else {
-      const res = await ctx.telegram.sendMessage(CH_ID, body, { parse_mode: 'HTML', disable_web_page_preview: false, ...kb });
+      // no image: one text message (includes CA inline)
+      const res = await ctx.telegram.sendMessage(CH_ID, fullCaption, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: false,
+        ...kb,
+      });
       messageId = res?.message_id;
     }
   } catch (e) {
@@ -215,9 +246,9 @@ bot.on('text', async (ctx) => {
     ca: caOrMint,
     chain: info.chain,
     ticker: info.ticker || undefined,
-    entryMc: info.mc ?? null,
-    peakMc: info.mc ?? null,
-    lastMc: info.mc ?? null,
+    entryMc: info.mc || null,
+    peakMc: info.mc || null,
+    lastMc: info.mc || null,
     multipliersHit: [],
     postedMessageId: messageId || undefined,
     caller: { tgId, username },
@@ -232,13 +263,19 @@ bot.on('text', async (ctx) => {
   );
 });
 
-// --------- error/launch ------------------------------------------------------
+// --- global error / launch ---------------------------------------------------
 bot.catch((err, ctx) => {
   console.error('Unhandled error while processing', ctx.update, err);
 });
 
 (async () => {
   try {
+    // One-instance safety: allow disabling local polling while Render runs
+    if (process.env.DISABLE_BOT_LAUNCH === '1') {
+      console.log('Bot launch disabled by env (DISABLE_BOT_LAUNCH=1).');
+      return;
+    }
+
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     await bot.launch({ dropPendingUpdates: true });
     console.log('🤖 mooncall bot ready');
