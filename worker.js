@@ -3,129 +3,138 @@ require('dotenv').config();
 require('./lib/db');
 
 const { Telegram } = require('telegraf');
-const tg = new Telegram(process.env.BOT_TOKEN);
-
 const Call = require('./model/call.model');
-const { getTokenInfo, usd, shortAddr } = require('./lib/price');
+const { getTokenInfo, usd } = require('./lib/price');
+const { tradeKeyboards } = require('./card');
 
+const tg = new Telegram(process.env.BOT_TOKEN);
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
 
-// how far back we keep tracking calls
+// config
+const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 1);
 const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);
+const MILESTONES = String(process.env.MILESTONES || '2,4,6,10')
+  .split(',')
+  .map(Number)
+  .filter((n) => n > 0)
+  .sort((a, b) => a - b);
 
-// how often we poll
-const INTERVAL_MS = (Number(process.env.CHECK_INTERVAL_MINUTES || 1)) * 60_000;
+const NOW = () => new Date();
 
-// 2x..8x alerts (boss request)
-const LOW_MILES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
-  .split(',').map(n => Number(n.trim())).filter(n => n > 1 && n < 10).sort((a,b)=>a-b);
-
-// 10x+ alerts (post again at bigger round numbers)
-const HI_MILES = String(process.env.HI_MILESTONES || '10,12,15,20,25,30')
-  .split(',').map(n => Number(n.trim())).filter(n => n >= 10).sort((a,b)=>a-b);
-
-function formatDuration(ms) {
-  const m = Math.floor(ms / 60000);
-  const h = Math.floor(m / 60);
-  const min = m % 60;
-  return `${h}h:${String(min).padStart(2, '0')}m`;
+function hoursBetween(a, b) {
+  return Math.max(0, (b - a) / 36e5);
+}
+function formatDuration(h) {
+  const hh = Math.floor(h);
+  const mm = Math.round((h - hh) * 60);
+  return `${hh}h:${String(mm).padStart(2, '0')}m`;
 }
 
-function lowTierText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
+function highestMilestone(x) {
+  let best = null;
+  for (const m of MILESTONES) if (x >= m) best = m;
+  return best;
+}
+
+// --- alert text builders -----------------------------------------------------
+function rocketAlert({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
-  const tag = tkr ? `$${tkr}` : shortAddr(ca);
+  const tag = tkr ? `$${tkr}` : ca.slice(0, 4) + '…' + ca.slice(-4);
   return (
     `${rockets} ${tag} hit ${xNow.toFixed(2)}× since call!\n\n` +
-    `📞 Called at MC: ${usd(entryMc)} by @${byUser}\n` +
+    `📞 Called at MC: ${usd(entryMc)}${byUser ? ` by @${byUser}` : ''}\n` +
     `🏆 Now MC: ${usd(nowMc)}`
   );
 }
 
-function highTierText({ tkr, entryMc, nowMc, xNow, sinceMs }) {
-  // Example: 🌕 $CRK 11x | 💹From 66.1K ↗️ 300.6K within 2h:50m
+function moonAlert({ tkr, entryMc, nowMc, xNow, hours }) {
   const tag = tkr ? `$${tkr}` : 'Token';
   return (
     `🌕 ${tag} ${xNow.toFixed(2)}x | ` +
-    `💹From ${usd(entryMc).replace('$','')} ↗️ ${usd(nowMc).replace('$','')} ` +
-    `within ${formatDuration(sinceMs)}`
+    `💹From ${usd(entryMc).replace('$', '')} ↗️ ${usd(nowMc).replace('$', '')} ` +
+    `within ${formatDuration(hours)}`
   );
 }
 
-async function tick() {
-  const createdSince = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
+// ---------------------------------------------------------------------------
+async function checkOnce() {
+  const since = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
 
-  // track recent calls only
-  const calls = await Call.find({ createdAt: { $gte: createdSince } }).limit(500);
+  // track only reasonably recent calls with a valid entry MC
+  const calls = await Call.find({
+    createdAt: { $gte: since },
+    entryMc: { $gt: 0 },
+  }).limit(500);
 
   for (const c of calls) {
     try {
-      // Pull fresh MC (your getTokenInfo already talks to Dexscreener)
       const info = await getTokenInfo(c.ca);
       if (!info || !info.mc) continue;
 
-      const entry = Number(c.entryMc || 0);
-      if (!entry) continue; // can't compute X; ensure entryMc is set when saving a call
-
       const nowMc = info.mc;
-      const xNow = nowMc / entry;
+      const peakMc = Math.max(c.peakMc || 0, nowMc);
+      const lastMc = nowMc;
 
-      // update last & peak
-      const newPeak = Math.max(Number(c.peakMc || 0), nowMc);
-      if (newPeak !== c.peakMc || nowMc !== c.lastMc) {
-        await Call.updateOne(
-          { _id: c._id },
-          { $set: { lastMc: nowMc, peakMc: newPeak } }
-        );
-      }
+      const xNow = nowMc / c.entryMc;
+      const xPeak = peakMc / c.entryMc;
 
+      // decide if we crossed a milestone
+      const hitNow = highestMilestone(xNow);
       const already = new Set(c.multipliersHit || []);
-      let changed = false;
 
-      // 2x..8x alerts
-      for (const X of LOW_MILES) {
-        if (xNow >= X && !already.has(X)) {
-          const txt = lowTierText({
-            tkr: c.ticker,
-            ca: c.ca,
-            xNow,
-            entryMc: entry,
-            nowMc,
-            byUser: c.caller?.username || c.caller?.tgId || 'user'
-          });
-          await tg.sendMessage(CH_ID, txt, { parse_mode: 'HTML' });
-          already.add(X);
-          changed = true;
-        }
+      // 2x–8x rockets
+      if (hitNow && hitNow >= 2 && hitNow < 10 && !already.has(hitNow)) {
+        const text = rocketAlert({
+          tkr: c.ticker,
+          ca: c.ca,
+          xNow,
+          entryMc: c.entryMc,
+          nowMc,
+          byUser: c.caller?.username || c.caller?.tgId,
+        });
+
+        const kb = tradeKeyboards(c.chain, info.chartUrl);
+        await tg.sendMessage(CH_ID, text, { parse_mode: 'HTML', ...kb });
+
+        already.add(hitNow);
       }
 
-      // 10x+ alerts
-      for (const X of HI_MILES) {
-        if (xNow >= X && !already.has(X)) {
-          const txt = highTierText({
-            tkr: c.ticker,
-            entryMc: entry,
-            nowMc,
-            xNow,
-            sinceMs: Date.now() - c.createdAt.getTime(),
-          });
-          await tg.sendMessage(CH_ID, txt, { parse_mode: 'HTML' });
-          already.add(X);
-          changed = true;
-        }
+      // 10x+ moon
+      if (xNow >= 10 && !already.has(10)) {
+        const hours = hoursBetween(c.createdAt, NOW());
+        const text = moonAlert({
+          tkr: c.ticker,
+          entryMc: c.entryMc,
+          nowMc,
+          xNow,
+          hours,
+        });
+
+        const kb = tradeKeyboards(c.chain, info.chartUrl);
+        await tg.sendMessage(CH_ID, text, { parse_mode: 'HTML', ...kb });
+
+        already.add(10);
       }
 
-      if (changed) {
-        await Call.updateOne(
-          { _id: c._id },
-          { $set: { multipliersHit: Array.from(already) } }
-        );
-      }
+      // persist metrics & hits
+      c.lastMc = lastMc;
+      c.peakMc = peakMc;
+      c.multipliersHit = Array.from(already).sort((a, b) => a - b);
+      await c.save();
     } catch (e) {
-      console.error('Worker error on', c.ca, e.message);
+      // swallow individual token errors; continue
+      // console.error('worker token error', c.ca, e.message);
     }
   }
 }
 
-console.log('📡 Worker running…');
-setInterval(tick, INTERVAL_MS);
-tick();
+async function main() {
+  console.log('📡 Worker running…');
+  await checkOnce();
+  setInterval(checkOnce, CHECK_MIN * 60 * 1000);
+}
+
+main().catch((e) => {
+  console.error('Worker crashed', e);
+  process.exit(1);
+});
