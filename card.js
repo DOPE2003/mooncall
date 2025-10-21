@@ -1,6 +1,5 @@
 // card.js
-// Channel "New Call" card, inline keyboards, and alert text helpers.
-
+// Channel "New Call" card + inline keyboards.
 const { Markup } = require('telegraf');
 const { usd } = require('./lib/price');
 
@@ -8,27 +7,20 @@ const { usd } = require('./lib/price');
 function parseTradeBots(envVar) {
   return String(envVar || '')
     .split(',')
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean)
-    .map(s => {
-      const [label, url] = s.split('|').map(x => x.trim());
+    .map((s) => {
+      const [label, url] = s.split('|').map((x) => x.trim());
       return { label: label || 'Bot', url: url || 'https://t.me' };
     });
 }
 
-function safeDexLink(name, url) {
-  const dexName = name || 'DEX';
-  if (!url) return dexName;
-  // Keep it simple & safe in HTML mode
-  return `<a href="${url}">${dexName}</a>`;
-}
-
 /**
- * Inline keyboard below a channel post.
- * First row: Chart · Trade · Boost
- * Next rows: bots from env (2 per row).
+ * Inline keyboard under a channel post:
+ *  - Row 1: Chart + Boost
+ *  - Next rows: trade bots from env per chain
  */
-function tradeKeyboards(chain, chartUrl, tradeUrl) {
+function tradeKeyboards(chain, chartUrl) {
   const bots =
     chain === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
@@ -40,8 +32,7 @@ function tradeKeyboards(chain, chartUrl, tradeUrl) {
   const rows = [
     [
       Markup.button.url('📈 Chart', chartUrl || 'https://dexscreener.com'),
-      Markup.button.url('🌕 Trade', tradeUrl || chartUrl || 'https://dexscreener.com'),
-      Markup.button.url('🚀 Boost', boostUrl),
+      Markup.button.url('Boost ⚡', boostUrl),
     ],
   ];
 
@@ -56,50 +47,39 @@ function tradeKeyboards(chain, chartUrl, tradeUrl) {
 }
 
 /**
- * Channel caption EXACTLY like the sample:
- *  - New Call by @user
- *  - NAME (DEX.LINK) ($TICKER)
- *  - plain CA/mint (copyable by long-press)
- *  - #CHAIN (DexName) | 🕓 age
- *  - Stats
- *  - UTC time line
- *  - Make a call here 👉 @bot
+ * Channel caption. CA is inline, in a code span so it’s easy to copy.
  */
 function channelCardText({
   user,
-  name,            // token name (optional)
-  tkr,             // ticker without $, e.g. BDTCH
-  chain,           // SOL / BSC
-  mintOrCa,        // raw CA/mint
-  stats,           // { mc, lp, vol24h }
-  ageHours,        // number
-  dexName,         // e.g. PIGEON.TRADE
-  dexUrl,          // link for the DEX name
-  botUsername,     // e.g. mooncal_bot (no @)
+  name,
+  tkr,
+  chain,
+  mintOrCa,
+  stats,
+  ageHours,
+  dexName,
+  dexUrl,
+  botUsername,
 }) {
-  const age = ageHours != null ? `${ageHours}h old` : '—';
-  const dexLabel = dexName || 'dex';
-  const dexDisplay = safeDexLink(dexLabel, dexUrl);
-  const tickerText = tkr ? `($${tkr})` : '';
-  const tokenTitle = `${name || (tkr ? `$${tkr}` : 'Token')} ${tickerText}`.trim();
-
-  const utcNow = new Date().toUTCString();
+  const age = Number.isFinite(ageHours) ? `${ageHours}h old` : '—';
+  const titleName = name ? `${name} ` : '';
+  const ticker = tkr ? `($${tkr})` : '';
+  const dexPart = dexUrl
+    ? `(<a href="${dexUrl}">${dexName || 'DEX'}</a>)`
+    : `(${dexName || 'DEX'})`;
 
   return (
     `New Call by @${user}\n\n` +
-    `${tokenTitle.replace(/\s+\(\$[^)]+\)$/, '')} (${dexDisplay}) ${tickerText}\n\n` +
-    `${mintOrCa}\n\n` +
-    `#${chain} (${dexLabel}) | 🕓 ${age}\n\n` +
+    `${titleName}${ticker} (${chain})\n\n` +
+    `<code>${mintOrCa}</code>\n\n` +            // <= copyable in place
+    `#${chain} ${dexPart} | 🕓 ${age}\n\n` +
     `📊 <b>Stats</b>\n` +
     `• MC: ${usd(stats.mc)}\n` +
     `• LP: ${stats.lp != null ? usd(stats.lp) : '—'}\n` +
     `• 24h Vol: ${usd(stats.vol24h)}\n\n` +
-    `${utcNow}\n\n` +
+    `${new Date().toUTCString()}\n\n` +
     `Make a call here 👉 @${botUsername}`
   );
 }
 
-module.exports = {
-  tradeKeyboards,
-  channelCardText,
-};
+module.exports = { channelCardText, tradeKeyboards };
