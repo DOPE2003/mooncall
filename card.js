@@ -16,11 +16,6 @@ function parseTradeBots(envVar) {
     });
 }
 
-/**
- * Inline keyboard below a channel post:
- *  - First row: Chart + Boost link
- *  - Following rows: trade bots configured in env per chain
- */
 function tradeKeyboards(chain, chartUrl) {
   const bots =
     chain === 'SOL'
@@ -47,14 +42,13 @@ function tradeKeyboards(chain, chartUrl) {
   return Markup.inlineKeyboard(rows);
 }
 
-// === New-call caption/text ===
-// Keep CA/mint as plain text so it's easy to select/copy in Telegram.
+// Keep CA/mint plain text so it’s easy to select/copy in Telegram.
 function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
   const age = ageHours != null ? `${ageHours}h old` : '—';
   return (
     `New Call by @${user}\n\n` +
     `${tkr ? `$${tkr}` : 'Token'} (${chain})\n\n` +
-    `${mintOrCa}\n\n` +                            // ← copyable CA/mint
+    `${mintOrCa}\n\n` +
     `#${chain} (${dex}) | 🕓 ${age}\n\n` +
     `📊 <b>Stats</b>\n` +
     `• MC when called: ${usd(stats.mc)}\n` +
@@ -63,7 +57,7 @@ function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
   );
 }
 
-// === PnL alerts (2×–8×) ===
+// Alerts
 function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
   const tag = tkr ? `$${tkr}` : shortAddr(ca);
@@ -74,11 +68,9 @@ function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
   );
 }
 
-// === PnL alerts (10×+) ===
 function highTierAlertText({ tkr, entryMc, nowMc, xNow, duration }) {
   const tag = tkr ? `$${tkr}` : 'Token';
   const durLabel = duration || '—';
-  // Remove $ sign for the “From/To” look your boss wanted
   return (
     `🌕 ${tag} ${xNow.toFixed(2)}x | 💹From ${usd(entryMc).replace('$', '')} ` +
     `↗️ ${usd(nowMc).replace('$', '')} within ${durLabel}`
