@@ -1,72 +1,34 @@
 // card.js
-// Formats the channel "New Call" card + inline keyboard with trade bots.
+// Channel "New Call" card, alert formatting, and inline keyboards.
 const { Markup } = require('telegraf');
-const { usd } = require('./lib/price');
+const { usd, shortAddr } = require('./lib/price');
 
-const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
-
-/** Parse comma-separated "Label|URL" items from env */
-const parseTradeBots = (envVar) => {
-  // Example: "📊 Axiom|https://t.me/axiom_app_bot,🐴 Trojan|https://t.me/TrojanWhisperBot"
+// Parse env list like: "📊 Axiom|https://t.me/axiom_app_bot,🐴 Trojan|https://..."
+function parseTradeBots(envVar) {
   return String(envVar || '')
     .split(',')
-    .map((s) => s.trim())
+    .map(s => s.trim())
     .filter(Boolean)
-    .map((s) => {
-      const [label, url] = s.split('|').map((x) => x.trim());
-      return { label, url };
+    .map(s => {
+      const [label, url] = s.split('|').map(x => x.trim());
+      return { label: label || 'Bot', url: url || 'https://t.me' };
     });
-};
-
-/**
- * Build the channel message body
- * @param {object} p
- * @param {string} p.user       - caller username (no @)
- * @param {string} p.tkr        - ticker symbol w/o $ (e.g. "CRK")
- * @param {string} p.chain      - "SOL" | "BSC"
- * @param {string} p.mintOrCa   - mint (SOL) or 0x CA (BSC)
- * @param {object} p.stats      - { mc, lp, vol24h }
- * @param {number} p.ageHours   - token age in hours
- * @param {string} p.dex        - "PumpFun" | "PancakeSwap" | etc.
- */
-function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
-  const age = Number.isFinite(ageHours) ? `${Math.floor(ageHours)}h old` : '—';
-  const ticker = tkr ? `$${tkr}` : 'Token';
-  const dexName = dex || 'DEX';
-
-  return (
-    `New Call by @${user}\n\n` +
-    `${ticker} (${chain})\n\n` +
-    // Show the full address in monospace so it’s easy to copy
-    `<code>${mintOrCa}</code>\n\n` +
-    `#${chain} (${dexName}) | 🕓 ${age}\n\n` +
-    `📊 <b>Stats</b>\n` +
-    `• MC: ${usd(stats.mc)}\n` +
-    `• LP: ${usd(stats.lp)}\n` +
-    `• 24h Vol: ${usd(stats.vol24h)}\n\n` +
-    `${new Date().toUTCString()}\n\n` +
-    (BOT_USERNAME ? `Make a call here 👉 @${BOT_USERNAME}` : '')
-  );
 }
 
-/**
- * Build inline keyboard with Chart + configured trade bots
- * (kept simple and compatible with your current mooncall.js)
- */
-function tradeKeyboards(chain) {
+function tradeKeyboards(chain, chartUrl) {
   const bots =
     chain === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
       : parseTradeBots(process.env.TRADE_BOTS_BSC);
 
-  // Generic chart home (still useful). If you later want token-specific
-  // links, pass the address into this function and build a per-chain URL.
-  const chartBtn = Markup.button.url('📈 Chart', 'https://dexscreener.com');
-  const tradeBtn = Markup.button.url('🌕 Trade', 'https://t.me'); // generic; real trade bots follow
+  const boostUrl = process.env.BOOST_URL || process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
+  const rows = [
+    [
+      Markup.button.url('📈 Chart', chartUrl || 'https://dexscreener.com'),
+      Markup.button.url('Boost ⚡', boostUrl),
+    ],
+  ];
 
-  const rows = [[chartBtn, tradeBtn]];
-
-  // Then the configured bots, 2 per row
   for (let i = 0; i < bots.length; i += 2) {
     const a = bots[i];
     const b = bots[i + 1];
@@ -77,4 +39,48 @@ function tradeKeyboards(chain) {
   return Markup.inlineKeyboard(rows);
 }
 
-module.exports = { channelCardText, tradeKeyboards };
+// ==== New-call post (caption/text) ====
+function channelCardText({ user, tkr, chain, mintOrCa, stats, ageHours, dex }) {
+  const age = ageHours != null ? `${ageHours}h old` : '—';
+  const caLine = `${mintOrCa}`; // copyable
+  return (
+    `New Call by @${user}\n\n` +
+    `${tkr ? `$${tkr}` : 'Token'} (${chain})\n\n` +
+    `${caLine}\n\n` +
+    `#${chain} (${dex}) | 🕓 ${age}\n\n` +
+    `📊 <b>Stats</b>\n` +
+    `• MC when called: ${usd(stats.mc)}\n` +
+    `• LP: ${usd(stats.lp)}\n` +
+    `• 24h Vol: ${usd(stats.vol24h)}`
+  );
+}
+
+// ==== PnL alerts (2×–8×) ====
+function lowTierAlertText({ tkr, ca, xNow, entryMc, nowMc, byUser }) {
+  // rockets: 2x → 4 rockets, 8x → 12 rockets (capped)
+  const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
+  const tag = tkr ? `$${tkr}` : shortAddr(ca);
+  return (
+    `${rockets} ${tag} soared by X${xNow.toFixed(2)} since was called!\n\n` +
+    `📞 MC when called: ${usd(entryMc)}${byUser ? ` by @${byUser}` : ''}\n` +
+    `🏆 MC now: ${usd(nowMc)}`
+  );
+}
+
+// ==== PnL alerts (10×+) ====
+function highTierAlertText({ tkr, entryMc, nowMc, xNow, duration }) {
+  // 🌕 $CRK 11x | 💹From 66.1K ↗️ 300.6K within 2h:50m
+  const tag = tkr ? `$${tkr}` : 'Token';
+  const durLabel = duration || '—';
+  return (
+    `🌕 ${tag} ${xNow.toFixed(2)}x | 💹From ${usd(entryMc).replace('$', '')} ` +
+    `↗️ ${usd(nowMc).replace('$', '')} within ${durLabel}`
+  );
+}
+
+module.exports = {
+  channelCardText,
+  tradeKeyboards,
+  lowTierAlertText,
+  highTierAlertText,
+};
