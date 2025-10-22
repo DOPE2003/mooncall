@@ -29,6 +29,9 @@ const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
 const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
+// keep a tiny in-memory “expecting a CA” flag per user
+const awaitingCA = new Set();
+
 // --- helpers -----------------------------------------------------------------
 const cIdForPrivate = (id) => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
 function viewChannelButton(messageId) {
@@ -42,6 +45,23 @@ const highestMilestone = (x) => {
 };
 const normalizeCa = (ca, chainUpper) =>
   chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca;
+
+// Extract a clean address from free-form user text.
+// - BSC: 0x + 40 hex
+// - SOL: 32–44 base58 chars, optionally followed by "pump"
+function extractAddress(input) {
+  const s = String(input || '').trim();
+
+  // Try BSC first
+  const bsc = s.match(/0x[a-fA-F0-9]{40}/);
+  if (bsc) return { chainHint: 'BSC', value: bsc[0] };
+
+  // SOL base58 (no 0 O I l), 32–44 chars, optionally with trailing "pump"
+  const sol = s.match(/([1-9A-HJ-NP-Za-km-z]{32,44})(?:pump)?$/);
+  if (sol) return { chainHint: 'SOL', value: sol[1] };
+
+  return null;
+}
 
 // --- UI: /start --------------------------------------------------------------
 bot.start(async (ctx) => {
@@ -76,7 +96,7 @@ bot.start(async (ctx) => {
   bot.on(t, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
 );
 
-// buttons
+// buttons (static)
 bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
   '📜 <b>Rules</b>\n\n' +
   '• One call per user in 24h (admins are exempt).\n' +
@@ -88,6 +108,19 @@ bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
   bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply('🚧 Available soon.')))
 );
 
+// Make a call: set “awaiting” flag + instructions
+bot.action('cmd:make', async (ctx) => {
+  await ctx.answerCbQuery();
+  awaitingCA.add(String(ctx.from.id));
+  await ctx.reply(
+    'Paste the token address now:\n' +
+    '• SOL: <code>Base58Mint</code> (PumpFun suffix like “…pump” is OK)\n' +
+    '• BSC: <code>0x…</code> (40 hex)',
+    { parse_mode: 'HTML' }
+  );
+});
+
+// Top callers
 bot.action('cmd:leaders', async (ctx) => {
   try {
     await ctx.answerCbQuery();
@@ -109,6 +142,7 @@ bot.action('cmd:leaders', async (ctx) => {
   }
 });
 
+// My calls
 bot.action('cmd:mycalls', async (ctx) => {
   try {
     await ctx.answerCbQuery();
@@ -127,24 +161,44 @@ bot.action('cmd:mycalls', async (ctx) => {
 
 // --- Token input flow --------------------------------------------------------
 bot.on('text', async (ctx) => {
-  const caOrMint = (ctx.message?.text || '').trim();
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
+  const raw = (ctx.message?.text || '').trim();
 
-  if (!isSolMint(caOrMint) && !isBsc(caOrMint)) return;
+  // Try to extract a CA/mint from whatever the user pasted
+  const extracted = extractAddress(raw);
 
-  // daily limit (except admins)
+  // If user pressed "Make a call" and pasted something invalid, guide them
+  if (!extracted) {
+    if (awaitingCA.has(tgId)) {
+      return ctx.reply(
+        'That doesn’t look like a valid address.\n' +
+        'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
+        { parse_mode: 'HTML' }
+      );
+    }
+    return; // ignore unrelated chatter
+  }
+
+  // From here on, we’ll handle the call; clear “awaiting”
+  awaitingCA.delete(tgId);
+
+  const caOrMint = extracted.value;
+
+  // One call per 24h unless admin
   const since = new Date(Date.now() - 24 * 3600 * 1000);
   if (!isAdmin(tgId)) {
     const exists = await Call.exists({ 'caller.tgId': tgId, createdAt: { $gte: since } });
     if (exists) return ctx.reply('You already made a call in the last 24h.');
   }
 
-  // fetch token info
+  // Fetch token info
   let info;
   try { info = await getTokenInfo(caOrMint); }
   catch (e) { console.error('price fetch failed:', e.message); }
-  if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
+  if (!info) {
+    return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
+  }
 
   const chainUpper = String(info.chain || '').toUpperCase();
 
@@ -166,7 +220,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // --- caller totals (for header) ------------------------------------------
+  // Caller totals for header
   const userCalls = await Call.find({ 'caller.tgId': tgId });
   const totalCalls = userCalls.length;
   const totalX = userCalls.reduce((sum, c) => {
@@ -176,7 +230,7 @@ bot.on('text', async (ctx) => {
   }, 0);
   const avgX = totalCalls ? totalX / totalCalls : 0;
 
-  // --- caption --------------------------------------------------------------
+  // Caption
   const chartUrl =
     info.chartUrl ||
     (chainUpper === 'SOL'
@@ -196,7 +250,7 @@ bot.on('text', async (ctx) => {
 
     createdOnName: info.dex || info.dexName || 'DEX',
     createdOnUrl: info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl,
-    dexPaid: info.dexPaid, // if your fetcher has it, else shows "—"
+    dexPaid: info.dexPaid,
 
     bubblemapUrl: info.bubblemapUrl,
     burnPct: info.liquidityBurnedPct,
@@ -207,7 +261,7 @@ bot.on('text', async (ctx) => {
     botUsername: BOT_USERNAME,
   });
 
-  // --- post --------------------------------------------------------------
+  // Post
   let messageId;
   try {
     const kb = tradeKeyboards(chainUpper, chartUrl);
@@ -230,7 +284,7 @@ bot.on('text', async (ctx) => {
     console.error('send to channel failed:', e?.response?.description || e.message);
   }
 
-  // --- save call -----------------------------------------------------------
+  // Save
   await Call.create({
     ca: normCa,
     chain: chainUpper,
