@@ -1,7 +1,19 @@
 // card.js
-// Channel "New Call" card + inline keyboards.
+// Rich channel card + inline keyboards.
 const { Markup } = require('telegraf');
 const { usd } = require('./lib/price');
+
+// HTML esc (safe for parse_mode:'HTML')
+const esc = (s = '') =>
+  String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+
+const boolIcon = (v) => (v === true ? '✅' : v === false ? '❌' : '—');
+const pct = (n) => (Number.isFinite(n) ? `${(+n).toFixed(0)}%` : '—');
 
 // Parse env list like: "📊 Axiom|https://t.me/axiom_app_bot,🐴 Trojan|https://..."
 function parseTradeBots(envVar) {
@@ -16,13 +28,13 @@ function parseTradeBots(envVar) {
 }
 
 /**
- * Inline keyboard under a channel post:
+ * Inline keyboard under a channel post
  *  - Row 1: Chart + Boost
  *  - Next rows: trade bots from env per chain
  */
 function tradeKeyboards(chain, chartUrl) {
   const bots =
-    chain === 'SOL'
+    String(chain).toUpperCase() === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
       : parseTradeBots(process.env.TRADE_BOTS_BSC);
 
@@ -47,38 +59,70 @@ function tradeKeyboards(chain, chartUrl) {
 }
 
 /**
- * Channel caption. CA is inline, in a code span so it’s easy to copy.
+ * Rich channel caption (copyable CA “└ <code>CA</code>”)
  */
 function channelCardText({
+  // caller
   user,
+  totals, // { totalCalls, totalX, avgX }
+  // token
   name,
   tkr,
   chain,
   mintOrCa,
-  stats,
-  ageHours,
-  dexName,
-  dexUrl,
-  botUsername,
+  // market
+  stats, // { mc, lp, vol24h }
+  // meta
+  createdOnName, // e.g. "PumpFun" / "PumpSwap"
+  createdOnUrl,
+  dexPaid, // boolean/undefined
+  bubblemapUrl, // optional
+  burnPct,     // number percent (0-100) or undefined
+  freezeAuth,  // boolean/undefined
+  mintAuth,    // boolean/undefined
+  twitterUrl,  // optional
+  botUsername, // required
 }) {
-  const age = Number.isFinite(ageHours) ? `${ageHours}h old` : '—';
-  const titleName = name ? `${name} ` : '';
-  const ticker = tkr ? `($${tkr})` : '';
-  const dexPart = dexUrl
-    ? `(<a href="${dexUrl}">${dexName || 'DEX'}</a>)`
-    : `(${dexName || 'DEX'})`;
+  const titleName = name ? esc(name) : 'Token';
+  const ticker = tkr ? esc(tkr) : '';
+  const ch = String(chain || '').toUpperCase();
+
+  const createdOn =
+    createdOnUrl
+      ? `<a href="${createdOnUrl}">${esc(createdOnName || 'DEX')}</a>`
+      : esc(createdOnName || 'DEX');
+
+  const bubbleLine = bubblemapUrl
+    ? `🫧 <a href="${bubblemapUrl}">Bubblemap</a>`
+    : `🫧 Bubblemap`;
+
+  const twitterLine = twitterUrl ? `<a href="${twitterUrl}">Twitter</a>` : 'Twitter';
+
+  const xFmt = (x) => (Number.isFinite(x) ? `${x.toFixed(2)}X` : '—');
 
   return (
-    `New Call by @${user}\n\n` +
-    `${titleName}${ticker} (${chain})\n\n` +
-    `<code>${mintOrCa}</code>\n\n` +            // <= copyable in place
-    `#${chain} ${dexPart} | 🕓 ${age}\n\n` +
-    `📊 <b>Stats</b>\n` +
-    `• MC: ${usd(stats.mc)}\n` +
-    `• LP: ${stats.lp != null ? usd(stats.lp) : '—'}\n` +
-    `• 24h Vol: ${usd(stats.vol24h)}\n\n` +
-    `${new Date().toUTCString()}\n\n` +
-    `Make a call here 👉 @${botUsername}`
+`Call by @${esc(user)}
+Total Calls: ${totals?.totalCalls ?? 0}
+Total X: ${xFmt(totals?.totalX ?? 0)}
+Average X per call:  ${xFmt(totals?.avgX ?? 0)}
+
+🪙 ${titleName}${ticker ? ` ($${ticker})` : ''}
+└<code>${esc(mintOrCa)}</code>
+
+🏦 Market Cap: ${usd(stats?.mc)}
+🛠 Created On: ${createdOn}
+🦅 DexS Paid?: ${boolIcon(dexPaid)}
+
+${bubbleLine}
+🔥 Liquidity Burned: ${pct(burnPct)} ${boolIcon(burnPct === 100)}
+❄️ Freeze Authority: ${boolIcon(freezeAuth)}
+➕ Mint Authority: ${boolIcon(mintAuth)}
+
+${twitterLine}
+
+🔍${ticker ? `$${ticker}` : ''} - 🔍CA
+
+Make a call here 👉 @${esc(botUsername)}`
   );
 }
 

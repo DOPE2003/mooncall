@@ -19,7 +19,7 @@ const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
-// only used to summarize in “already called” message if you want
+// for duplicate summary only
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
   .split(',')
   .map((n) => Number(n))
@@ -37,36 +37,11 @@ function viewChannelButton(messageId) {
   const url = `https://t.me/c/${shortId}/${messageId}`;
   return Markup.inlineKeyboard([[Markup.button.url('📣 View Channel', url)]]);
 }
-
-// Normalize CA for dedupe checks: BSC addresses -> lowercase; SOL mints unchanged.
-function normalizeCa(ca, chainUpper) {
-  return chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca;
-}
-function highestMilestone(x) {
-  let best = null;
-  for (const m of MILESTONES) if (x >= m) best = m;
-  return best;
-}
-
-const rulesText =
-  '📜 <b>Rules</b>\n\n' +
-  '• One call per user in 24h (admins are exempt).\n' +
-  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
-  '• We track PnLs & post milestone alerts.\n' +
-  '• Best performers climb the leaderboard.';
-
-const menuKeyboard = () =>
-  Markup.inlineKeyboard([
-    [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
-    [Markup.button.callback('👥 Community Calls', 'cmd:community')],
-    [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
-    [Markup.button.callback('🧾 Make a call', 'cmd:make')],
-    [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
-    [Markup.button.callback('📜 Rules', 'cmd:rules')],
-    [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
-    [Markup.button.callback('🚀 Boost', 'cmd:boost')],
-    [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
-  ]);
+const highestMilestone = (x) => {
+  let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best;
+};
+const normalizeCa = (ca, chainUpper) =>
+  chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca;
 
 // --- UI: /start --------------------------------------------------------------
 bot.start(async (ctx) => {
@@ -76,31 +51,43 @@ bot.start(async (ctx) => {
       '» Each user can make 1 call per day\n' +
       '» Calls are tracked by PnL performance\n' +
       '» The top performer gets rewards + bragging rights',
-    { parse_mode: 'HTML', ...menuKeyboard() }
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
+      [Markup.button.callback('👥 Community Calls', 'cmd:community')],
+      [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
+      [Markup.button.callback('🧾 Make a call', 'cmd:make')],
+      [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
+      [Markup.button.callback('📜 Rules', 'cmd:rules')],
+      [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
+      [Markup.button.callback('🚀 Boost', 'cmd:boost')],
+      [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
+    ]) }
   );
 
   const botLink = `https://t.me/${BOT_USERNAME}`;
-  // Raw links message to render a preview block like your screenshot
   await ctx.reply(
     `Telegram\nMoon Call 🌕\nThe ultimate call channel ⚡👉:\n${CHANNEL_LINK}\n\n` +
       `Moon Call bot 👉: ${botLink}`
   );
 });
 
-// --- Simple media guard ------------------------------------------------------
-['photo', 'document', 'video', 'audio', 'sticker', 'voice'].forEach((type) =>
-  bot.on(type, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
+// media guard
+['photo','document','video','audio','sticker','voice'].forEach((t) =>
+  bot.on(t, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
 );
 
-// --- Buttons -----------------------------------------------------------------
-bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(rulesText, { parse_mode: 'HTML' })));
-bot.action('cmd:make', async (ctx) => (await ctx.answerCbQuery(), ctx.reply('Paste the token address (SOL or BSC).')));
-bot.action('cmd:community', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
-bot.action('cmd:subscribe', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
-bot.action('cmd:boost', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
-bot.action('cmd:boosted', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
+// buttons
+bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
+  '📜 <b>Rules</b>\n\n' +
+  '• One call per user in 24h (admins are exempt).\n' +
+  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
+  '• We track PnLs & post milestone alerts.\n' +
+  '• Best performers climb the leaderboard.', { parse_mode:'HTML' })));
 
-// --- Top Callers -------------------------------------------------------------
+['community','subscribe','boost','boosted'].forEach(name =>
+  bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply('🚧 Available soon.')))
+);
+
 bot.action('cmd:leaders', async (ctx) => {
   try {
     await ctx.answerCbQuery();
@@ -122,27 +109,20 @@ bot.action('cmd:leaders', async (ctx) => {
   }
 });
 
-// --- My calls ----------------------------------------------------------------
 bot.action('cmd:mycalls', async (ctx) => {
   try {
     await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
     const list = await Call.find({ 'caller.tgId': tgId }).sort({ createdAt: -1 }).limit(10);
     if (!list.length) return ctx.reply('You have no calls yet.');
-
     const lines = list.map((c) => {
       const entry = usd(c.entryMc);
       const now = usd(c.lastMc);
       const tkr = c.ticker ? `$${c.ticker}` : '—';
       return `• ${tkr}\n   MC when called: ${entry}\n   MC now: ${now}`;
     });
-
-    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, {
-      parse_mode: 'HTML',
-    });
-  } catch (e) {
-    console.error(e);
-  }
+    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode:'HTML' });
+  } catch (e) { console.error(e); }
 });
 
 // --- Token input flow --------------------------------------------------------
@@ -151,10 +131,9 @@ bot.on('text', async (ctx) => {
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
 
-  // Accept only SOL mint or BSC 0x
   if (!isSolMint(caOrMint) && !isBsc(caOrMint)) return;
 
-  // one call per 24h unless admin
+  // daily limit (except admins)
   const since = new Date(Date.now() - 24 * 3600 * 1000);
   if (!isAdmin(tgId)) {
     const exists = await Call.exists({ 'caller.tgId': tgId, createdAt: { $gte: since } });
@@ -163,64 +142,72 @@ bot.on('text', async (ctx) => {
 
   // fetch token info
   let info;
-  try {
-    info = await getTokenInfo(caOrMint);
-  } catch (e) {
-    console.error('price fetch failed:', e.message);
-  }
+  try { info = await getTokenInfo(caOrMint); }
+  catch (e) { console.error('price fetch failed:', e.message); }
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
   const chainUpper = String(info.chain || '').toUpperCase();
 
-  // ----- DUPLICATE CHECK (by normalized CA + chain) --------------------------
+  // DUP check
   const normCa = normalizeCa(caOrMint, chainUpper);
   const existing = await Call.findOne({ ca: normCa, chain: chainUpper }).sort({ createdAt: -1 });
 
   if (existing) {
-    const xNow =
-      info.mc && existing.entryMc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
+    const xNow = info.mc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
-
     await ctx.reply(
       `⚠️ <b>Token already called</b> by @${existing.caller?.username || existing.caller?.tgId}.\n\n` +
-        `Called MC: ${usd(existing.entryMc)}\n` +
-        (xNow
-          ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call` +
-            (hit ? ` (hit <b>${hit}×</b> milestone)` : '') +
-            `.`
-          : `Now MC: ${usd(info.mc)}.`),
-      {
-        parse_mode: 'HTML',
-        ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}),
-      }
+      `Called MC: ${usd(existing.entryMc)}\n` +
+      (xNow
+        ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call` + (hit ? ` (hit <b>${hit}×</b>)` : '') + `.`
+        : `Now MC: ${usd(info.mc)}.`),
+      { parse_mode:'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
     );
-    return; // do not create a duplicate call
+    return;
   }
 
-  // ----- NEW CALL POST -------------------------------------------------------
+  // --- caller totals (for header) ------------------------------------------
+  const userCalls = await Call.find({ 'caller.tgId': tgId });
+  const totalCalls = userCalls.length;
+  const totalX = userCalls.reduce((sum, c) => {
+    if (!c.entryMc || c.entryMc <= 0) return sum;
+    const peak = c.peakMc || c.entryMc;
+    return sum + peak / c.entryMc;
+  }, 0);
+  const avgX = totalCalls ? totalX / totalCalls : 0;
+
+  // --- caption --------------------------------------------------------------
   const chartUrl =
     info.chartUrl ||
     (chainUpper === 'SOL'
       ? `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`
       : `https://dexscreener.com/bsc/${encodeURIComponent(caOrMint)}`);
 
-  const captionRaw = channelCardText({
+  const caption = channelCardText({
     user: username,
+    totals: { totalCalls, totalX, avgX },
+
     name: info.name,
     tkr: info.ticker || '',
     chain: chainUpper,
-    mintOrCa: caOrMint, // will make copyable below
+    mintOrCa: caOrMint,
+
     stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
-    ageHours: info.ageHours,
-    dexName: info.dex || 'DEX',
-    dexUrl: info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl,
+
+    createdOnName: info.dex || info.dexName || 'DEX',
+    createdOnUrl: info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl,
+    dexPaid: info.dexPaid, // if your fetcher has it, else shows "—"
+
+    bubblemapUrl: info.bubblemapUrl,
+    burnPct: info.liquidityBurnedPct,
+    freezeAuth: info.freezeAuthority,
+    mintAuth: info.mintAuthority,
+
+    twitterUrl: info.twitter,
     botUsername: BOT_USERNAME,
   });
 
-  // Make CA copyable inside caption (works under photo too).
-  const caption = captionRaw.replace(caOrMint, `<code>${caOrMint}</code>`);
-
-  // post
+  // --- post --------------------------------------------------------------
   let messageId;
   try {
     const kb = tradeKeyboards(chainUpper, chartUrl);
@@ -243,10 +230,10 @@ bot.on('text', async (ctx) => {
     console.error('send to channel failed:', e?.response?.description || e.message);
   }
 
-  // save call (store normalized CA AND uppercase chain)
+  // --- save call -----------------------------------------------------------
   await Call.create({
     ca: normCa,
-    chain: chainUpper, // normalized in model too, but we set it explicitly here
+    chain: chainUpper,
     ticker: info.ticker || undefined,
     entryMc: info.mc || 0,
     peakMc: info.mc || 0,
@@ -272,7 +259,6 @@ bot.catch((err, ctx) => {
 
 (async () => {
   try {
-    // Avoid local polling when a hosted instance is also running.
     if (process.env.DISABLE_BOT_LAUNCH === '1') {
       console.log('Bot launch disabled by env (DISABLE_BOT_LAUNCH=1).');
       return;
