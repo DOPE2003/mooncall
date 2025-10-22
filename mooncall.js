@@ -19,7 +19,8 @@ const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
-const MILESTONES = String(process.env.MILESTONES || '2,4,6,10')
+// low-tier list also used for “already called” summary
+const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
   .split(',')
   .map((n) => Number(n))
   .filter((n) => n > 0)
@@ -37,14 +38,9 @@ function viewChannelButton(messageId) {
   return Markup.inlineKeyboard([[Markup.button.url('📣 View Channel', url)]]);
 }
 
-// normalize CA so duplicates are detected reliably
 function normalizeCa(ca, chain) {
-  if (!ca) return ca;
-  // BSC 0x addresses should be lowercase; Solana mints left as-is
-  return chain === 'BSC' ? ca.toLowerCase() : ca;
+  return chain === 'BSC' ? String(ca).toLowerCase() : ca;
 }
-
-// find highest milestone hit by multiple x (e.g., x=3.7 => 3 if milestones [2,3,4...])
 function highestMilestone(x) {
   let best = null;
   for (const m of MILESTONES) if (x >= m) best = m;
@@ -95,24 +91,17 @@ bot.start(async (ctx) => {
 );
 
 // --- Buttons -----------------------------------------------------------------
-bot.action('cmd:rules', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply(rulesText, { parse_mode: 'HTML' });
-});
-bot.action('cmd:make', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('Paste the token address (SOL or BSC).');
-});
+bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(rulesText, { parse_mode: 'HTML' })));
+bot.action('cmd:make', async (ctx) => (await ctx.answerCbQuery(), ctx.reply('Paste the token address (SOL or BSC).')));
 bot.action('cmd:community', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 bot.action('cmd:subscribe', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 bot.action('cmd:boost', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 bot.action('cmd:boosted', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)));
 
-// --- Top Callers: Σ(peak/entry) per user, medals for top 3 -------------------
+// --- Top Callers -------------------------------------------------------------
 bot.action('cmd:leaders', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-
     const rows = await Call.aggregate([
       { $project: { user: '$caller.username', tgId: '$caller.tgId', entry: '$entryMc', peak: '$peakMc' } },
       { $match: { entry: { $gt: 0 }, peak: { $gt: 0 } } },
@@ -121,15 +110,9 @@ bot.action('cmd:leaders', async (ctx) => {
       { $sort: { sumX: -1 } },
       { $limit: 10 },
     ]);
-
     if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
-
     const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-    const lines = rows.map((r, i) => {
-      const handle = r._id.user || r._id.tgId;
-      return `${medal(i)} @${handle} — ${r.sumX.toFixed(2)}× total`;
-    });
-
+    const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
     await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) {
     console.error(e);
@@ -143,20 +126,14 @@ bot.action('cmd:mycalls', async (ctx) => {
     await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
     const list = await Call.find({ 'caller.tgId': tgId }).sort({ createdAt: -1 }).limit(10);
-
     if (!list.length) return ctx.reply('You have no calls yet.');
-
     const lines = list.map((c) => {
       const entry = usd(c.entryMc);
       const now = usd(c.lastMc);
       const tkr = c.ticker ? `$${c.ticker}` : '—';
       return `• ${tkr}\n   MC when called: ${entry}\n   MC now: ${now}`;
     });
-
-    await ctx.reply(
-      `🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`,
-      { parse_mode: 'HTML' }
-    );
+    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode: 'HTML' });
   } catch (e) {
     console.error(e);
   }
@@ -177,7 +154,7 @@ bot.on('text', async (ctx) => {
     if (exists) return ctx.reply('You already made a call in the last 24h.');
   }
 
-  // fetch token info from dexscreener
+  // fetch token info
   let info;
   try {
     info = await getTokenInfo(caOrMint);
@@ -186,15 +163,13 @@ bot.on('text', async (ctx) => {
   }
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
-  // ----- DUPLICATE CHECK -----------------------------------------------------
+  // DUP check (use normalized CA)
   const normCa = normalizeCa(caOrMint, info.chain);
   const existing = await Call.findOne({ ca: normCa }).sort({ createdAt: -1 });
 
   if (existing) {
-    const xNow =
-      info.mc && existing.entryMc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
+    const xNow = info.mc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
-
     await ctx.reply(
       `⚠️ <b>Token already called</b> by @${existing.caller?.username || existing.caller?.tgId}.\n\n` +
         `Called MC: ${usd(existing.entryMc)}\n` +
@@ -205,34 +180,35 @@ bot.on('text', async (ctx) => {
           : `Now MC: ${usd(info.mc)}.`),
       { parse_mode: 'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
     );
-    return; // do not create a duplicate call
+    return;
   }
 
-  // ----- NEW CALL POST -------------------------------------------------------
+  // compose caption (force copyable CA)
+  const captionRaw = channelCardText({
+    user: username,
+    name: info.name,
+    tkr: info.ticker || '',
+    chain: info.chain,
+    mintOrCa: caOrMint,
+    stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
+    ageHours: info.ageHours,
+    dexName: info.dex || 'DEX',
+    dexUrl: info.tradeUrl || info.pairUrl || info.chartUrl,
+    botUsername: BOT_USERNAME,
+  });
+  // make the CA selectable/copyable even under a photo
+  const caption = captionRaw.replace(caOrMint, `<code>${caOrMint}</code>`);
+
   const chartUrl =
     info.chartUrl ||
     (info.chain === 'SOL'
       ? `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`
       : `https://dexscreener.com/bsc/${encodeURIComponent(caOrMint)}`);
-  const tradeUrl = info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl;
 
-  const caption = channelCardText({
-    user: username,
-    name: info.name,
-    tkr: info.ticker || '',
-    chain: info.chain,
-    mintOrCa: caOrMint, // stays inline; wrapped as <code>...</code> inside the caption
-    stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
-    ageHours: info.ageHours,
-    dexName: info.dex || 'DEX',
-    dexUrl: tradeUrl,
-    botUsername: BOT_USERNAME,
-  });
-
+  // post
   let messageId;
   try {
     const kb = tradeKeyboards(info.chain, chartUrl);
-
     if (WANT_IMAGE && info.imageUrl) {
       const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
         caption,
@@ -249,10 +225,10 @@ bot.on('text', async (ctx) => {
       messageId = res?.message_id;
     }
   } catch (e) {
-    console.error('send to channel failed:', e.response?.description || e.message);
+    console.error('send to channel failed:', e?.response?.description || e.message);
   }
 
-  // Save call (store normalized CA for future duplicate checks)
+  // save call (store normalized CA)
   await Call.create({
     ca: normCa,
     chain: info.chain,
@@ -281,7 +257,6 @@ bot.catch((err, ctx) => {
 
 (async () => {
   try {
-    // Avoid 409 conflicts: set DISABLE_BOT_LAUNCH=1 locally when Render is live.
     if (process.env.DISABLE_BOT_LAUNCH === '1') {
       console.log('Bot launch disabled by env (DISABLE_BOT_LAUNCH=1).');
       return;
