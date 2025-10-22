@@ -114,8 +114,8 @@ bot.action('cmd:make', async (ctx) => {
   awaitingCA.add(String(ctx.from.id));
   await ctx.reply(
     'Paste the token address now:\n' +
-    '• SOL: <code>Base58Mint</code> (PumpFun suffix like “…pump” is OK)\n' +
-    '• BSC: <code>0x…</code> (40 hex)',
+    '• SOL: is accepted\n' +
+    '• BSC: is accepted',
     { parse_mode: 'HTML' }
   );
 });
