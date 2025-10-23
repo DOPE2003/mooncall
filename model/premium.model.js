@@ -1,16 +1,18 @@
 // model/premium.model.js
-const mongoose = require('mongoose'); // ✅ use mongoose; lib/db sets up the connection
+const mongoose = require('mongoose');
 
 const PremiumSchema = new mongoose.Schema(
   {
-    tgId: { type: String, index: true, unique: true, required: true },
+    tgId: { type: String, index: true, unique: true },
     username: String,
 
-    // permanent premium plan (4 calls/day)
+    // premium flags
+    permanent: { type: Boolean, default: false }, // lifetime premium
     callsPerDay: { type: Number, default: 4 },
-    permanent: { type: Boolean, default: true },
 
-    notes: String,
+    // manual verification flow
+    pending: { type: Boolean, default: false },
+    txSig: { type: String, default: null },
   },
   { timestamps: true }
 );
