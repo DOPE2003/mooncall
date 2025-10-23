@@ -127,7 +127,7 @@ bot.action('cmd:make', async (ctx) => {
   await ctx.answerCbQuery();
   awaitingCA.add(String(ctx.from.id));
   await ctx.reply(
-    'Paste the token address now:\n• Saolana (SOL): is accepted in Moon Call \n• 🆕🆕 New Bnb (BSC): is accepted ',
+    'Paste the token address now:\n• Saolana (SOL): is accepted in Moon Call \n• 🆕🆕  Bnb (BSC): is accepted in Moon Call',
     { parse_mode: 'HTML' }
   );
 });
