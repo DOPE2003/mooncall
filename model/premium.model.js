@@ -1,20 +1,23 @@
 // model/premium.model.js
 const mongoose = require('mongoose');
 
-const PremiumSchema = new mongoose.Schema(
+const PremiumUserSchema = new mongoose.Schema(
   {
-    tgId: { type: String, index: true, unique: true },
-    username: String,
+    tgId: { type: String, required: true, unique: true },
 
-    // premium flags
-    permanent: { type: Boolean, default: false }, // lifetime premium
+    // Lifetime premium flag
+    permanent: { type: Boolean, default: false },
+
+    // What premium means (we use 4 calls/day)
     callsPerDay: { type: Number, default: 4 },
 
-    // manual verification flow
+    // User clicked “I Paid ✅” (waiting for signature or manual verification)
     pending: { type: Boolean, default: false },
-    txSig: { type: String, default: null },
+
+    // Last signature provided by user (optional)
+    lastPaymentTx: { type: String, default: null },
   },
   { timestamps: true }
 );
 
-module.exports = mongoose.model('PremiumUser', PremiumSchema);
+module.exports = mongoose.model('PremiumUser', PremiumUserSchema);

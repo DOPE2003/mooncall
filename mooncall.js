@@ -4,11 +4,11 @@ require('./lib/db');
 
 const { Telegraf, Markup } = require('telegraf');
 const Call = require('./model/call.model');
-const PremiumUser = require('./model/premium.model');
+const PremiumUser = require('./model/premium.model'); // <— NEW
 const { getTokenInfo, isSolMint, isBsc, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
 
-// ——— env / constants ——————————————————————————————————————————————
+// --- env / constants ---------------------------------------------------------
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
@@ -20,12 +20,11 @@ const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
-// premium / payments
-const PREMIUM_WALLET = process.env.PREMIUM_SOL_WALLET || '64Um13jy1E2ApiDwwPx5mYK3QQZ2fzLknPYvdvWxF5mZ';
-const PREMIUM_PRICE = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
-const ADMIN_NOTIFY_ID = process.env.ADMIN_NOTIFY_ID ? String(process.env.ADMIN_NOTIFY_ID) : null;
+const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim(); // your wallet (not shown in text)
+const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);   // default 0.1 SOL
+const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();       // your tg numeric id for DM
 
-// duplicates summary only
+// For duplicate summary only
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
   .split(',')
   .map((n) => Number(n))
@@ -35,11 +34,11 @@ const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
 const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
-// tiny in-memory flags
+// simple state flags
 const awaitingCA = new Set();
-const awaitingSig = new Set();
+const awaitingTxSig = new Set(); // <— when user taps “Submit Tx Signature”
 
-// ——— helpers ——————————————————————————————————————————————
+// --- helpers -----------------------------------------------------------------
 const cIdForPrivate = (id) => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
 function viewChannelButton(messageId) {
   if (!messageId) return Markup.inlineKeyboard([]);
@@ -47,10 +46,13 @@ function viewChannelButton(messageId) {
   const url = `https://t.me/c/${shortId}/${messageId}`;
   return Markup.inlineKeyboard([[Markup.button.url('📣 View Channel', url)]]);
 }
-const highestMilestone = (x) => { let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best; };
-const normalizeCa = (ca, chainUpper) => (chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca);
+const highestMilestone = (x) => {
+  let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best;
+};
+const normalizeCa = (ca, chainUpper) =>
+  chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca;
 
-// Parse free-form text for a CA/mint
+// Extract address (CA/mint) from user text
 function extractAddress(input) {
   const s = String(input || '').trim();
   const bsc = s.match(/0x[a-fA-F0-9]{40}/);
@@ -60,55 +62,57 @@ function extractAddress(input) {
   return null;
 }
 
+// Is this a plausible Solana tx signature?
 function looksLikeSig(s) {
-  const b58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
-  return typeof s === 'string' && s.length >= 40 && s.length <= 120 && b58.test(s);
+  return /^[1-9A-HJ-NP-Za-km-z]{43,88}$/.test(String(s).trim());
 }
 
-// Phantom universal link (HTTPS) — Telegram-safe
-function phantomPayUrl({ to, amount, label, message, reference }) {
-  const base = 'https://phantom.app/ul/transfer';
-  const p = new URLSearchParams({
-    to,
-    amount: String(amount),
-    token: 'SOL',
-    network: 'mainnet-beta',
-    label: label || 'Payment',
-    message: message || '',
-  });
-  if (reference) p.append('reference', String(reference));
-  return `${base}?${p.toString()}`;
-}
-
+// Daily limit: admin = ∞, premium = 4/day, normal = 1/day
 async function getDailyLimit(tgId) {
   if (isAdmin(tgId)) return Infinity;
   const p = await PremiumUser.findOne({ tgId: String(tgId) }).lean();
-  if (p && p.permanent) return Math.max(1, p.callsPerDay || 4); // lifetime premium
+  if (p?.permanent) return p.callsPerDay || 4;
   return 1;
 }
 
-// ——— UI: /start ——————————————————————————————————————————————
+// Count calls in the last 24h
+async function callsInLast24h(tgId) {
+  const since = new Date(Date.now() - 24 * 3600 * 1000);
+  return Call.countDocuments({ 'caller.tgId': String(tgId), createdAt: { $gte: since } });
+}
+
+// Phantom HTTPS link (Telegram-safe)
+function phantomPayLink(recipient, amount, label, message) {
+  const base = 'https://phantom.app/ul/transfer';
+  const q = new URLSearchParams({
+    recipient,
+    amount: String(amount),
+    token: 'SOL',
+    label,
+    message,
+  });
+  return `${base}?${q.toString()}`;
+}
+
+// --- UI: /start --------------------------------------------------------------
 bot.start(async (ctx) => {
   await ctx.reply(
     'Welcome to 🌖 Mooncall bot 🌖 .\n\n' +
       'Call tokens, track PnL, and compete for rewards.\n\n' +
-      '» Normal: 1 call/day\n' +
-      '» Premium: 4 calls/day (lifetime)\n' +
-      '» Admins: unlimited',
-    {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
-        [Markup.button.callback('👥 Community Calls', 'cmd:community')],
-        [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
-        [Markup.button.callback('🧾 Make a call', 'cmd:make')],
-        [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
-        [Markup.button.callback('📜 Rules', 'cmd:rules')],
-        [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
-        [Markup.button.callback('🚀 Boost', 'cmd:boost')],
-        [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
-      ]),
-    }
+      '» Each user can make 1 call per day\n' +
+      '» Calls are tracked by PnL performance\n' +
+      '» The top performer gets rewards + bragging rights',
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
+      [Markup.button.callback('👥 Community Calls', 'cmd:community')],
+      [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
+      [Markup.button.callback('🧾 Make a call', 'cmd:make')],
+      [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
+      [Markup.button.callback('📜 Rules', 'cmd:rules')],
+      [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
+      [Markup.button.callback('🚀 Boost', 'cmd:boost')],
+      [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
+    ]) }
   );
 
   const botLink = `https://t.me/${BOT_USERNAME}`;
@@ -119,139 +123,86 @@ bot.start(async (ctx) => {
 });
 
 // media guard
-['photo', 'document', 'video', 'audio', 'sticker', 'voice'].forEach((t) =>
+['photo','document','video','audio','sticker','voice'].forEach((t) =>
   bot.on(t, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
 );
 
 // static buttons
-bot.action('cmd:rules', async (ctx) => (
-  await ctx.answerCbQuery(),
-  ctx.reply(
-    '📜 <b>Rules</b>\n\n' +
-      '• Normal users: 1 call/day\n' +
-      '• Premium users: 4 calls/day (lifetime)\n' +
-      '• Admins: unlimited\n' +
-      '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
-      '• We track PnLs & post milestone alerts.\n' +
-      '• Best performers climb the leaderboard.',
-    { parse_mode: 'HTML' }
-  )
-));
+bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
+  '📜 <b>Rules</b>\n\n' +
+  '• One call per user in 24h (admins are exempt).\n' +
+  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
+  '• We track PnLs & post milestone alerts.\n' +
+  '• Best performers climb the leaderboard.', { parse_mode:'HTML' })));
 
-['community', 'boost', 'boosted'].forEach((name) =>
+['community','boost','boosted'].forEach(name =>
   bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)))
 );
 
-// ——— Subscribe / Premium ——————————————————————————————————————————————
+// --- PREMIUM: Subscribe ------------------------------------------------------
 bot.action('cmd:subscribe', async (ctx) => {
   await ctx.answerCbQuery();
-
-  const tgId = String(ctx.from.id);
-  const username = ctx.from.username || tgId;
-
-  const payUrl = phantomPayUrl({
-    to: PREMIUM_WALLET,
-    amount: PREMIUM_PRICE,
-    label: 'Mooncall Premium (lifetime)',
-    message: `Premium for @${username}`,
-    reference: tgId,
-  });
+  if (!PREMIUM_SOL_WALLET) {
+    return ctx.reply('Premium is temporarily unavailable. Please try again later.');
+  }
+  const payUrl = phantomPayLink(
+    PREMIUM_SOL_WALLET,
+    PREMIUM_PRICE_SOL,
+    'Mooncall Premium (lifetime)',
+    `Premium for @${ctx.from.username || ctx.from.id}`
+  );
 
   const kb = Markup.inlineKeyboard([
-    [Markup.button.url(`💳 Pay ${PREMIUM_PRICE} SOL`, payUrl)],
-    [Markup.button.callback('✅ I Paid', 'cmd:paid')],
-    [Markup.button.callback('🧾 Submit Tx Signature (optional)', 'cmd:submit_tx')],
+    [Markup.button.url(`Pay ${PREMIUM_PRICE_SOL} SOL`, payUrl)],
+    [Markup.button.callback('I Paid ✅', 'premium:paid')],
+    [Markup.button.callback('Submit Tx Signature', 'premium:txsig')],
   ]);
 
   await ctx.reply(
     '⭐ <b>Premium</b>\n\n' +
-      'Unlock <b>4 calls per day forever</b>.\n' +
-      `Price: <b>${PREMIUM_PRICE} SOL</b>\n\n` +
-      'You can either:\n' +
-      '• Tap <b>I Paid</b> (we will verify & approve quickly), or\n' +
-      '• Paste your <b>transaction signature</b> to activate instantly.\n',
+    'Unlock <b>4 calls per day forever</b>.\n' +
+    `Price: <b>${PREMIUM_PRICE_SOL} SOL</b>\n\n` +
+    '1) Tap “Pay … SOL” and complete the transfer in your wallet.\n' +
+    '2) Then tap “Submit Tx Signature” and paste your transaction signature.\n' +
+    'If you can’t find your signature, tap “I Paid ✅” and we’ll review it.',
     { parse_mode: 'HTML', ...kb }
   );
 });
 
-bot.action('cmd:paid', async (ctx) => {
+// User says "I Paid" — mark pending and notify admin (no approve buttons)
+bot.action('premium:paid', async (ctx) => {
   await ctx.answerCbQuery();
   const tgId = String(ctx.from.id);
-  const username = ctx.from.username || tgId;
 
-  await PremiumUser.findOneAndUpdate(
+  await PremiumUser.updateOne(
     { tgId },
-    { $set: { tgId, username, pending: true, permanent: false } },
+    { $set: { pending: true }, $setOnInsert: { permanent: false, callsPerDay: 4 } },
     { upsert: true }
   );
 
-  // notify admin for manual approval
+  await ctx.reply('Thanks! Payment marked as pending. If you have the tx signature, tap "Submit Tx Signature" to auto-activate.');
+
   if (ADMIN_NOTIFY_ID) {
-    try {
-      const kb = Markup.inlineKeyboard([
-        [Markup.button.callback('✅ Approve', `adm:approve:${tgId}`), Markup.button.callback('❌ Reject', `adm:reject:${tgId}`)],
-      ]);
-      await bot.telegram.sendMessage(
-        ADMIN_NOTIFY_ID,
-        `💰 Payment pending\nUser: @${username} (${tgId})\nAction: Approve to grant lifetime premium.`,
-        { ...kb }
-      );
-    } catch (_) {}
+    await bot.telegram.sendMessage(
+      ADMIN_NOTIFY_ID,
+      `💰 <b>Payment marked as pending</b>\nUser: @${ctx.from.username || tgId} (${tgId})\nAmount: ${PREMIUM_PRICE_SOL} SOL`,
+      { parse_mode: 'HTML' }
+    );
   }
-
-  await ctx.reply('Thanks! Payment marked as <b>pending</b>. We’ll approve shortly.', { parse_mode: 'HTML' });
 });
 
-bot.action('cmd:submit_tx', async (ctx) => {
+// Ask for tx signature (auto-activation path)
+bot.action('premium:txsig', async (ctx) => {
   await ctx.answerCbQuery();
-  const tgId = String(ctx.from.id);
-  awaitingSig.add(tgId);
-  await ctx.reply('Please paste your <b>transaction signature</b>:', { parse_mode: 'HTML' });
+  awaitingTxSig.add(String(ctx.from.id));
+  await ctx.reply(
+    'Please paste your <b>transaction signature</b>.\n' +
+    'Tip: In Phantom → Recent Activity → the transaction → “Copy Signature”.',
+    { parse_mode: 'HTML' }
+  );
 });
 
-// Admin approve/reject
-bot.action(/adm:(approve|reject):(\d+)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const who = String(ctx.from.id);
-  if (!isAdmin(who)) return ctx.reply('Only admins can do that.');
-
-  const [, act, targetId] = ctx.match;
-  const doc = await PremiumUser.findOne({ tgId: String(targetId) });
-  if (!doc) return ctx.reply('User not found.');
-
-  if (act === 'approve') {
-    doc.permanent = true;
-    doc.pending = false;
-    doc.callsPerDay = 4;
-    await doc.save();
-
-    try {
-      await bot.telegram.sendMessage(
-        targetId,
-        '✅ Premium activated! You can now make <b>4 calls/day</b>.',
-        { parse_mode: 'HTML' }
-      );
-    } catch (_) {}
-    return ctx.reply(`Approved: ${targetId}`);
-  }
-
-  if (act === 'reject') {
-    doc.permanent = false;
-    doc.pending = false;
-    await doc.save();
-
-    try {
-      await bot.telegram.sendMessage(
-        targetId,
-        '❌ Payment not verified. If this is a mistake, please contact support.',
-        { parse_mode: 'HTML' }
-      );
-    } catch (_) {}
-    return ctx.reply(`Rejected: ${targetId}`);
-  }
-});
-
-// ——— Top callers ——————————————————————————————————————————————
+// --- Leaderboard -------------------------------------------------------------
 bot.action('cmd:leaders', async (ctx) => {
   try {
     await ctx.answerCbQuery();
@@ -273,7 +224,7 @@ bot.action('cmd:leaders', async (ctx) => {
   }
 });
 
-// ——— My calls ——————————————————————————————————————————————
+// --- My calls ----------------------------------------------------------------
 bot.action('cmd:mycalls', async (ctx) => {
   try {
     await ctx.answerCbQuery();
@@ -286,80 +237,74 @@ bot.action('cmd:mycalls', async (ctx) => {
       const tkr = c.ticker ? `$${c.ticker}` : '—';
       return `• ${tkr}\n   MC when called: ${entry}\n   MC now: ${now}`;
     });
-    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode: 'HTML' });
+    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode:'HTML' });
   } catch (e) { console.error(e); }
 });
 
-// ——— Make a call flow ——————————————————————————————————————————————
-bot.action('cmd:make', async (ctx) => {
-  await ctx.answerCbQuery();
-  awaitingCA.add(String(ctx.from.id));
-  await ctx.reply(
-    'Paste the token address now:\n' +
-      '• SOL: <code>Base58Mint</code> (…pump suffix is OK)\n' +
-      '• BSC: <code>0x</code> + 40 hex',
-    { parse_mode: 'HTML' }
-  );
-});
-
-// ——— Token input & signature handling ————————————————————————————————————
+// --- Token input + tx signature intake --------------------------------------
 bot.on('text', async (ctx) => {
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
   const raw = (ctx.message?.text || '').trim();
 
-  // 1) Optional premium signature flow
-  if (awaitingSig.has(tgId)) {
-    if (!looksLikeSig(raw)) {
-      return ctx.reply('That doesn’t look like a valid transaction signature. Please paste the signature string.');
+  // 1) If we asked for tx signature, process that first
+  if (awaitingTxSig.has(tgId)) {
+    // Accept plain signature or a solscan link
+    const maybeSig = raw.replace(/^https?:\/\/(www\.)?solscan\.io\/tx\//i, '').trim();
+    if (!looksLikeSig(maybeSig)) {
+      return ctx.reply('That does not look like a valid Solana signature. Please paste the signature only.');
     }
-    awaitingSig.delete(tgId);
 
-    await PremiumUser.findOneAndUpdate(
+    // Auto-activate
+    await PremiumUser.updateOne(
       { tgId },
-      { $set: { tgId, username, txSig: raw, permanent: true, pending: false, callsPerDay: 4 } },
+      { $set: { permanent: true, pending: false, callsPerDay: 4, lastPaymentTx: maybeSig } },
       { upsert: true }
     );
+    awaitingTxSig.delete(tgId);
+
+    await ctx.reply('✅ Premium activated! You can now make 4 calls/day (lifetime).');
 
     if (ADMIN_NOTIFY_ID) {
-      try {
-        await bot.telegram.sendMessage(
-          ADMIN_NOTIFY_ID,
-          `💰 Premium (auto-activated by signature)\nUser: @${username} (${tgId})\nSig: <code>${raw}</code>`,
-          { parse_mode: 'HTML' }
-        );
-      } catch (_) {}
-    }
-
-    return ctx.reply('✅ Premium activated! You can now make <b>4 calls/day</b>.', { parse_mode: 'HTML' });
-  }
-
-  // 2) Make-a-call flow
-  const extracted = extractAddress(raw);
-
-  if (!extracted) {
-    if (awaitingCA.has(tgId)) {
-      return ctx.reply(
-        'That doesn’t look like a valid address.\n' +
-          'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
+      await bot.telegram.sendMessage(
+        ADMIN_NOTIFY_ID,
+        `✅ <b>Premium auto-activated</b>\nUser: @${username} (${tgId})\nTx: <code>${maybeSig}</code>`,
         { parse_mode: 'HTML' }
       );
     }
     return;
   }
 
-  awaitingCA.delete(tgId);
-  const caOrMint = extracted.value;
+  // 2) Token address flow
+  const extracted = extractAddress(raw);
+  if (!extracted) {
+    if (awaitingCA.has(tgId)) {
+      return ctx.reply(
+        'That doesn’t look like a valid address.\n' +
+        'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
+        { parse_mode: 'HTML' }
+      );
+    }
+    return; // ignore non-address messages
+  }
 
-  // Daily limit check
-  const since = new Date(Date.now() - 24 * 3600 * 1000);
-  const limit = await getDailyLimit(tgId);
+  // user provided an address; stop waiting for CA
+  awaitingCA.delete(tgId);
+
+  // Daily limit enforcement
   if (!isAdmin(tgId)) {
-    const used = await Call.countDocuments({ 'caller.tgId': tgId, createdAt: { $gte: since } });
+    const limit = await getDailyLimit(tgId);
+    const used = await callsInLast24h(tgId);
     if (used >= limit) {
-      return ctx.reply(`You reached your daily limit (${limit}/24h). Tap ⭐ Subscribe to raise it.`);
+      return ctx.reply(
+        limit === 1
+          ? 'You already made a call in the last 24h.'
+          : `You reached your ${limit} calls in the last 24h.`
+      );
     }
   }
+
+  const caOrMint = extracted.value;
 
   // Fetch token info
   let info;
@@ -369,24 +314,25 @@ bot.on('text', async (ctx) => {
 
   const chainUpper = String(info.chain || '').toUpperCase();
 
-  // Duplicate check
+  // DUP check
   const normCa = normalizeCa(caOrMint, chainUpper);
   const existing = await Call.findOne({ ca: normCa, chain: chainUpper }).sort({ createdAt: -1 });
+
   if (existing) {
     const xNow = info.mc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
     await ctx.reply(
       `⚠️ <b>Token already called</b> by @${existing.caller?.username || existing.caller?.tgId}.\n\n` +
-        `Called MC: ${usd(existing.entryMc)}\n` +
-        (xNow
-          ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
-          : `Now MC: ${usd(info.mc)}.`),
-      { parse_mode: 'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
+      `Called MC: ${usd(existing.entryMc)}\n` +
+      (xNow
+        ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
+        : `Now MC: ${usd(info.mc)}.`),
+      { parse_mode:'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
     );
     return;
   }
 
-  // Caller totals (optional header usage)
+  // Caller totals for header
   const userCalls = await Call.find({ 'caller.tgId': tgId });
   const totalCalls = userCalls.length;
   const totalX = userCalls.reduce((sum, c) => {
@@ -396,15 +342,14 @@ bot.on('text', async (ctx) => {
   }, 0);
   const avgX = totalCalls ? totalX / totalCalls : 0;
 
-  // Chart URL
+  // Caption
   const chartUrl =
     info.chartUrl ||
     (chainUpper === 'SOL'
       ? `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`
       : `https://dexscreener.com/bsc/${encodeURIComponent(caOrMint)}`);
 
-  // Caption (ensure CA is copyable)
-  const rawCaption = channelCardText({
+  const caption = channelCardText({
     user: username,
     totals: { totalCalls, totalX, avgX },
 
@@ -427,9 +372,8 @@ bot.on('text', async (ctx) => {
     twitterUrl: info.twitter,
     botUsername: BOT_USERNAME,
   });
-  const caption = rawCaption.replace(caOrMint, `<code>${caOrMint}</code>`);
 
-  // Post to channel
+  // Post
   let messageId;
   try {
     const kb = tradeKeyboards(chainUpper, chartUrl);
@@ -474,7 +418,7 @@ bot.on('text', async (ctx) => {
   );
 });
 
-// ——— errors / launch ——————————————————————————————————————————————
+// --- global error / launch ---------------------------------------------------
 bot.catch((err, ctx) => {
   console.error('Unhandled error while processing', ctx.update, err);
 });
