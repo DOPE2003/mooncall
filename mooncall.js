@@ -4,7 +4,7 @@ require('./lib/db');
 
 const { Telegraf, Markup } = require('telegraf');
 const Call = require('./model/call.model');
-const PremiumUser = require('./model/premium.model'); // <— NEW
+const PremiumUser = require('./model/premium.model');
 const { getTokenInfo, isSolMint, isBsc, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
 
@@ -20,9 +20,9 @@ const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
-const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim(); // your wallet (not shown in text)
-const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);   // default 0.1 SOL
-const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();       // your tg numeric id for DM
+const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim();
+const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
+const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();
 
 // For duplicate summary only
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
@@ -36,7 +36,7 @@ const SOON = '🚧 Available soon.';
 
 // simple state flags
 const awaitingCA = new Set();
-const awaitingTxSig = new Set(); // <— when user taps “Submit Tx Signature”
+const awaitingTxSig = new Set();
 
 // --- helpers -----------------------------------------------------------------
 const cIdForPrivate = (id) => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
@@ -62,7 +62,7 @@ function extractAddress(input) {
   return null;
 }
 
-// Is this a plausible Solana tx signature?
+// plausible Solana tx signature?
 function looksLikeSig(s) {
   return /^[1-9A-HJ-NP-Za-km-z]{43,88}$/.test(String(s).trim());
 }
@@ -138,6 +138,18 @@ bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
 ['community','boost','boosted'].forEach(name =>
   bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)))
 );
+
+// --- Make a call (FIXED: handler was missing) --------------------------------
+bot.action('cmd:make', async (ctx) => {
+  await ctx.answerCbQuery();
+  awaitingCA.add(String(ctx.from.id));
+  await ctx.reply(
+    'Paste the token address now:\n' +
+    '• SOL: <code>Base58Mint</code> (PumpFun suffix like “…pump” is OK)\n' +
+    '• BSC: <code>0x…</code> (40 hex)',
+    { parse_mode: 'HTML' }
+  );
+});
 
 // --- PREMIUM: Subscribe ------------------------------------------------------
 bot.action('cmd:subscribe', async (ctx) => {
@@ -249,13 +261,11 @@ bot.on('text', async (ctx) => {
 
   // 1) If we asked for tx signature, process that first
   if (awaitingTxSig.has(tgId)) {
-    // Accept plain signature or a solscan link
     const maybeSig = raw.replace(/^https?:\/\/(www\.)?solscan\.io\/tx\//i, '').trim();
     if (!looksLikeSig(maybeSig)) {
       return ctx.reply('That does not look like a valid Solana signature. Please paste the signature only.');
     }
 
-    // Auto-activate
     await PremiumUser.updateOne(
       { tgId },
       { $set: { permanent: true, pending: false, callsPerDay: 4, lastPaymentTx: maybeSig } },
