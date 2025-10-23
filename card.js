@@ -1,9 +1,9 @@
 // card.js
-// Rich channel card + inline keyboards (with Bubblemap support).
+// Rich channel card + inline keyboards.
 const { Markup } = require('telegraf');
 const { usd } = require('./lib/price');
 
-// HTML escape (safe for parse_mode:'HTML')
+// HTML esc (safe for parse_mode:'HTML')
 const esc = (s = '') =>
   String(s)
     .replace(/&/g,'&amp;')
@@ -29,10 +29,10 @@ function parseTradeBots(envVar) {
 
 /**
  * Inline keyboard under a channel post
- *  - Row 1: Chart + (Bubblemap if available) + Boost
+ *  - Row 1: Chart + Boost
  *  - Next rows: trade bots from env per chain
  */
-function tradeKeyboards(chain, chartUrl, bubblemapUrl) {
+function tradeKeyboards(chain, chartUrl) {
   const bots =
     String(chain).toUpperCase() === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
@@ -41,11 +41,12 @@ function tradeKeyboards(chain, chartUrl, bubblemapUrl) {
   const boostUrl =
     process.env.BOOST_URL || process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 
-  const firstRow = [Markup.button.url('📈 Chart', chartUrl || 'https://dexscreener.com')];
-  if (bubblemapUrl) firstRow.push(Markup.button.url('🫧 Bubblemap', bubblemapUrl));
-  firstRow.push(Markup.button.url('Boost ⚡', boostUrl));
-
-  const rows = [firstRow];
+  const rows = [
+    [
+      Markup.button.url('📈 Chart', chartUrl || 'https://dexscreener.com'),
+      Markup.button.url('Boost ⚡', boostUrl),
+    ],
+  ];
 
   for (let i = 0; i < bots.length; i += 2) {
     const a = bots[i];
@@ -59,10 +60,9 @@ function tradeKeyboards(chain, chartUrl, bubblemapUrl) {
 
 /**
  * Rich channel caption (copyable CA “└ <code>CA</code>”)
- * Shows Bubblemap line only when provided.
  */
 function channelCardText({
-  // caller header
+  // caller
   user,
   totals, // { totalCalls, totalX, avgX }
   // token
@@ -72,7 +72,7 @@ function channelCardText({
   mintOrCa,
   // market
   stats, // { mc, lp, vol24h }
-  // meta / provenance
+  // meta
   createdOnName, // e.g. "PumpFun" / "PumpSwap"
   createdOnUrl,
   dexPaid, // boolean/undefined
@@ -85,6 +85,8 @@ function channelCardText({
 }) {
   const titleName = name ? esc(name) : 'Token';
   const ticker = tkr ? esc(tkr) : '';
+  const ch = String(chain || '').toUpperCase();
+
   const createdOn =
     createdOnUrl
       ? `<a href="${createdOnUrl}">${esc(createdOnName || 'DEX')}</a>`
@@ -92,9 +94,10 @@ function channelCardText({
 
   const bubbleLine = bubblemapUrl
     ? `🫧 <a href="${bubblemapUrl}">Bubblemap</a>`
-    : ''; // hide entirely if not supported
+    : `🫧 Bubblemap`;
 
   const twitterLine = twitterUrl ? `<a href="${twitterUrl}">Twitter</a>` : 'Twitter';
+
   const xFmt = (x) => (Number.isFinite(x) ? `${x.toFixed(2)}X` : '—');
 
   return (
@@ -109,7 +112,9 @@ Average X per call:  ${xFmt(totals?.avgX ?? 0)}
 🏦 Market Cap: ${usd(stats?.mc)}
 🛠 Created On: ${createdOn}
 🦅 DexS Paid?: ${boolIcon(dexPaid)}
-${bubbleLine ? `${bubbleLine}\n` : ''}🔥 Liquidity Burned: ${pct(burnPct)} ${boolIcon(burnPct === 100)}
+
+${bubbleLine}
+🔥 Liquidity Burned: ${pct(burnPct)} ${boolIcon(burnPct === 100)}
 ❄️ Freeze Authority: ${boolIcon(freezeAuth)}
 ➕ Mint Authority: ${boolIcon(mintAuth)}
 
