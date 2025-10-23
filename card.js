@@ -91,7 +91,7 @@ function channelCardText({
       : esc(createdOnName || 'DEX');
 
   const bubbleLine = bubblemapUrl
-    ? `🫧 <a href="${bubblemapUrl}">Bubblemap</a>`
+    ? `/n🫧 <a href="${bubblemapUrl}">Bubblemap</a>`
     : ''; // hide entirely if not supported
 
   const twitterLine = twitterUrl ? `<a href="${twitterUrl}">Twitter</a>` : 'Twitter';
