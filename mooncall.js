@@ -5,7 +5,7 @@ require('./lib/db');
 const { Telegraf, Markup } = require('telegraf');
 const Call = require('./model/call.model');
 const PremiumUser = require('./model/premium.model');
-const { getTokenInfo, isSolMint, isBsc, usd } = require('./lib/price');
+const { getTokenInfo, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
 
 // --- env / constants ---------------------------------------------------------
@@ -20,23 +20,23 @@ const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
-const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim();
-const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
-const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();
+const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim(); // wallet for premium
+const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);   // price in SOL
+const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();       // your TG id to be notified
 
-// For duplicate summary only
+// duplicate-summary milestones (UI only)
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
   .split(',')
-  .map((n) => Number(n))
+  .map(Number)
   .filter((n) => n > 0)
   .sort((a, b) => a - b);
 
 const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
-// simple state flags
-const awaitingCA = new Set();
-const awaitingTxSig = new Set();
+// ephemeral state
+const awaitingCA = new Set();      // users who clicked "Make a call"
+const awaitingTxSig = new Set();   // users who clicked "Submit Tx Signature"
 
 // --- helpers -----------------------------------------------------------------
 const cIdForPrivate = (id) => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
@@ -46,13 +46,10 @@ function viewChannelButton(messageId) {
   const url = `https://t.me/c/${shortId}/${messageId}`;
   return Markup.inlineKeyboard([[Markup.button.url('📣 View Channel', url)]]);
 }
-const highestMilestone = (x) => {
-  let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best;
-};
-const normalizeCa = (ca, chainUpper) =>
-  chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca;
+const highestMilestone = (x) => { let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best; };
+const normalizeCa = (ca, chainUpper) => (chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca);
 
-// Extract address (CA/mint) from user text
+// Extract address from text (BSC / SOL). Allows "...pump" suffix for PumpFun.
 function extractAddress(input) {
   const s = String(input || '').trim();
   const bsc = s.match(/0x[a-fA-F0-9]{40}/);
@@ -62,26 +59,26 @@ function extractAddress(input) {
   return null;
 }
 
-// plausible Solana tx signature?
+// Solana signature shape
 function looksLikeSig(s) {
   return /^[1-9A-HJ-NP-Za-km-z]{43,88}$/.test(String(s).trim());
 }
 
-// Daily limit: admin = ∞, premium = 4/day, normal = 1/day
+// Daily call limit
 async function getDailyLimit(tgId) {
   if (isAdmin(tgId)) return Infinity;
   const p = await PremiumUser.findOne({ tgId: String(tgId) }).lean();
-  if (p?.permanent) return p.callsPerDay || 4;
+  if (p?.permanent) return p.callsPerDay || 4; // lifetime premium
   return 1;
 }
 
-// Count calls in the last 24h
+// Number of calls in last 24h
 async function callsInLast24h(tgId) {
   const since = new Date(Date.now() - 24 * 3600 * 1000);
   return Call.countDocuments({ 'caller.tgId': String(tgId), createdAt: { $gte: since } });
 }
 
-// Phantom HTTPS link (Telegram-safe)
+// Phantom wallet link (https URI, Telegram-safe)
 function phantomPayLink(recipient, amount, label, message) {
   const base = 'https://phantom.app/ul/transfer';
   const q = new URLSearchParams({
@@ -94,6 +91,23 @@ function phantomPayLink(recipient, amount, label, message) {
   return `${base}?${q.toString()}`;
 }
 
+// Compute Bubblemap URL for EVM chains if API didn't provide one
+function getBubblemapUrl(chainUpper, caNorm) {
+  const m = {
+    ETH: 'eth', ETHEREUM: 'eth',
+    BSC: 'bsc',
+    ARBITRUM: 'arbitrum', ARB: 'arbitrum',
+    BASE: 'base',
+    OPTIMISM: 'optimism', OP: 'optimism',
+    POLYGON: 'polygon', MATIC: 'polygon',
+    AVALANCHE: 'avalanche', AVAX: 'avalanche',
+  };
+  const key = m[chainUpper];
+  if (!key) return null;
+  if (!caNorm?.startsWith?.('0x')) return null;
+  return `https://app.bubblemaps.io/token/${key}/${caNorm}`;
+}
+
 // --- UI: /start --------------------------------------------------------------
 bot.start(async (ctx) => {
   await ctx.reply(
@@ -102,17 +116,20 @@ bot.start(async (ctx) => {
       '» Each user can make 1 call per day\n' +
       '» Calls are tracked by PnL performance\n' +
       '» The top performer gets rewards + bragging rights',
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-      [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
-      [Markup.button.callback('👥 Community Calls', 'cmd:community')],
-      [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
-      [Markup.button.callback('🧾 Make a call', 'cmd:make')],
-      [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
-      [Markup.button.callback('📜 Rules', 'cmd:rules')],
-      [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
-      [Markup.button.callback('🚀 Boost', 'cmd:boost')],
-      [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
-    ]) }
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
+        [Markup.button.callback('👥 Community Calls', 'cmd:community')],
+        [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
+        [Markup.button.callback('🧾 Make a call', 'cmd:make')],
+        [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
+        [Markup.button.callback('📜 Rules', 'cmd:rules')],
+        [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
+        [Markup.button.callback('🚀 Boost', 'cmd:boost')],
+        [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
+      ]),
+    }
   );
 
   const botLink = `https://t.me/${BOT_USERNAME}`;
@@ -123,30 +140,35 @@ bot.start(async (ctx) => {
 });
 
 // media guard
-['photo','document','video','audio','sticker','voice'].forEach((t) =>
+['photo', 'document', 'video', 'audio', 'sticker', 'voice'].forEach((t) =>
   bot.on(t, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
 );
 
 // static buttons
-bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
-  '📜 <b>Rules</b>\n\n' +
-  '• One call per user in 24h (admins are exempt).\n' +
-  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
-  '• We track PnLs & post milestone alerts.\n' +
-  '• Best performers climb the leaderboard.', { parse_mode:'HTML' })));
+bot.action('cmd:rules', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    '📜 <b>Rules</b>\n\n' +
+      '• One call per user in 24h (admins are exempt).\n' +
+      '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
+      '• We track PnLs & post milestone alerts.\n' +
+      '• Best performers climb the leaderboard.',
+    { parse_mode: 'HTML' }
+  );
+});
 
-['community','boost','boosted'].forEach(name =>
+['community', 'boost', 'boosted'].forEach((name) =>
   bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)))
 );
 
-// --- Make a call (FIXED: handler was missing) --------------------------------
+// --- Make a call -------------------------------------------------------------
 bot.action('cmd:make', async (ctx) => {
   await ctx.answerCbQuery();
   awaitingCA.add(String(ctx.from.id));
   await ctx.reply(
     'Paste the token address now:\n' +
-    '• SOL: is accepted\n' +
-    '• BSC: is accepted 🆕',
+      '• SOL (PumpFun suffix “…pump” allowed) \n' +
+      '• BSC 0x… (40 hex)\n',
     { parse_mode: 'HTML' }
   );
 });
@@ -172,16 +194,16 @@ bot.action('cmd:subscribe', async (ctx) => {
 
   await ctx.reply(
     '⭐ <b>Premium</b>\n\n' +
-    'Unlock <b>4 calls per day forever</b>.\n' +
-    `Price: <b>${PREMIUM_PRICE_SOL} SOL</b>\n\n` +
-    '1) Tap “Pay … SOL” and complete the transfer in your wallet.\n' +
-    '2) Then tap “Submit Tx Signature” and paste your transaction signature.\n' +
-    'If you can’t find your signature, tap “I Paid ✅” and we’ll review it.',
+      'Unlock <b>4 calls per day forever</b>.\n' +
+      `Price: <b>${PREMIUM_PRICE_SOL} SOL</b>\n\n` +
+      '1) Tap “Pay … SOL” and complete the transfer in your wallet.\n' +
+      '2) Then tap “Submit Tx Signature” and paste your transaction signature.\n' +
+      'If you can’t find your signature, tap “I Paid ✅” and we’ll review it.',
     { parse_mode: 'HTML', ...kb }
   );
 });
 
-// User says "I Paid" — mark pending and notify admin (no approve buttons)
+// User says "I Paid" — mark pending and notify admin
 bot.action('premium:paid', async (ctx) => {
   await ctx.answerCbQuery();
   const tgId = String(ctx.from.id);
@@ -192,7 +214,9 @@ bot.action('premium:paid', async (ctx) => {
     { upsert: true }
   );
 
-  await ctx.reply('Thanks! Payment marked as pending. If you have the tx signature, tap "Submit Tx Signature" to auto-activate.');
+  await ctx.reply(
+    'Thanks! Payment marked as pending. If you have the tx signature, tap “Submit Tx Signature” to auto-activate.'
+  );
 
   if (ADMIN_NOTIFY_ID) {
     await bot.telegram.sendMessage(
@@ -203,13 +227,13 @@ bot.action('premium:paid', async (ctx) => {
   }
 });
 
-// Ask for tx signature (auto-activation path)
+// Ask for tx signature (auto-activation)
 bot.action('premium:txsig', async (ctx) => {
   await ctx.answerCbQuery();
   awaitingTxSig.add(String(ctx.from.id));
   await ctx.reply(
     'Please paste your <b>transaction signature</b>.\n' +
-    'Tip: In Phantom → Recent Activity → the transaction → “Copy Signature”.',
+      'Tip: In Phantom → Recent Activity → the transaction → “Copy Signature”.',
     { parse_mode: 'HTML' }
   );
 });
@@ -228,7 +252,9 @@ bot.action('cmd:leaders', async (ctx) => {
     ]);
     if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
     const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-    const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
+    const lines = rows.map(
+      (r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`
+    );
     await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) {
     console.error(e);
@@ -249,17 +275,21 @@ bot.action('cmd:mycalls', async (ctx) => {
       const tkr = c.ticker ? `$${c.ticker}` : '—';
       return `• ${tkr}\n   MC when called: ${entry}\n   MC now: ${now}`;
     });
-    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode:'HTML' });
-  } catch (e) { console.error(e); }
+    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, {
+      parse_mode: 'HTML',
+    });
+  } catch (e) {
+    console.error(e);
+  }
 });
 
-// --- Token input + tx signature intake --------------------------------------
+// --- Text intake: tx signatures & token calls --------------------------------
 bot.on('text', async (ctx) => {
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
   const raw = (ctx.message?.text || '').trim();
 
-  // 1) If we asked for tx signature, process that first
+  // 1) Handle premium signature flow
   if (awaitingTxSig.has(tgId)) {
     const maybeSig = raw.replace(/^https?:\/\/(www\.)?solscan\.io\/tx\//i, '').trim();
     if (!looksLikeSig(maybeSig)) {
@@ -291,17 +321,16 @@ bot.on('text', async (ctx) => {
     if (awaitingCA.has(tgId)) {
       return ctx.reply(
         'That doesn’t look like a valid address.\n' +
-        'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
+          'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
         { parse_mode: 'HTML' }
       );
     }
     return; // ignore non-address messages
   }
 
-  // user provided an address; stop waiting for CA
   awaitingCA.delete(tgId);
 
-  // Daily limit enforcement
+  // calls/day limit
   if (!isAdmin(tgId)) {
     const limit = await getDailyLimit(tgId);
     const used = await callsInLast24h(tgId);
@@ -316,28 +345,30 @@ bot.on('text', async (ctx) => {
 
   const caOrMint = extracted.value;
 
-  // Fetch token info
+  // Fetch token info from dexscreener (and your enrichers)
   let info;
-  try { info = await getTokenInfo(caOrMint); }
-  catch (e) { console.error('price fetch failed:', e.message); }
+  try {
+    info = await getTokenInfo(caOrMint);
+  } catch (e) {
+    console.error('price fetch failed:', e.message);
+  }
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
   const chainUpper = String(info.chain || '').toUpperCase();
 
-  // DUP check
+  // Duplicate check
   const normCa = normalizeCa(caOrMint, chainUpper);
   const existing = await Call.findOne({ ca: normCa, chain: chainUpper }).sort({ createdAt: -1 });
-
   if (existing) {
     const xNow = info.mc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
     await ctx.reply(
       `⚠️ <b>Token already called</b> by @${existing.caller?.username || existing.caller?.tgId}.\n\n` +
-      `Called MC: ${usd(existing.entryMc)}\n` +
-      (xNow
-        ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
-        : `Now MC: ${usd(info.mc)}.`),
-      { parse_mode:'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
+        `Called MC: ${usd(existing.entryMc)}\n` +
+        (xNow
+          ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
+          : `Now MC: ${usd(info.mc)}.`),
+      { parse_mode: 'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
     );
     return;
   }
@@ -352,13 +383,17 @@ bot.on('text', async (ctx) => {
   }, 0);
   const avgX = totalCalls ? totalX / totalCalls : 0;
 
-  // Caption
+  // Build URLs
   const chartUrl =
     info.chartUrl ||
     (chainUpper === 'SOL'
       ? `https://dexscreener.com/solana/${encodeURIComponent(caOrMint)}`
       : `https://dexscreener.com/bsc/${encodeURIComponent(caOrMint)}`);
 
+  const tradeUrl = info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl;
+  const bubblemapUrl = info.bubblemapUrl || getBubblemapUrl(chainUpper, normCa);
+
+  // Caption (rich, bright)
   const caption = channelCardText({
     user: username,
     totals: { totalCalls, totalX, avgX },
@@ -371,19 +406,23 @@ bot.on('text', async (ctx) => {
     stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
 
     createdOnName: info.dex || info.dexName || 'DEX',
-    createdOnUrl: info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl,
-    dexPaid: info.dexPaid,
+    createdOnUrl: tradeUrl,
 
-    bubblemapUrl: info.bubblemapUrl,
-    burnPct: info.liquidityBurnedPct,
-    freezeAuth: info.freezeAuthority,
-    mintAuth: info.mintAuthority,
+    curveProgress: info.curveProgress,          // 0..1 or 0..100
+    dexPaid: info.dexPaid,                      // boolean
 
+    bubblemapUrl,
+    burnPct: info.liquidityBurnedPct,           // number
+    freezeAuth: info.freezeAuthority,           // boolean
+    mintAuth: info.mintAuthority,               // boolean
+
+    websiteUrl: info.website,
     twitterUrl: info.twitter,
+    chartUrl,
     botUsername: BOT_USERNAME,
   });
 
-  // Post
+  // Post to channel
   let messageId;
   try {
     const kb = tradeKeyboards(chainUpper, chartUrl);
@@ -406,7 +445,7 @@ bot.on('text', async (ctx) => {
     console.error('send to channel failed:', e?.response?.description || e.message);
   }
 
-  // Save
+  // Persist call
   await Call.create({
     ca: normCa,
     chain: chainUpper,
