@@ -3,18 +3,19 @@
 const { Markup } = require('telegraf');
 const { usd } = require('./lib/price');
 
-// HTML esc (safe for parse_mode:'HTML')
+// HTML escape (safe for parse_mode:'HTML')
 const esc = (s = '') =>
   String(s)
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
-    .replace(/'/g,'&#39;');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
 const boolIcon = (v) => (v === true ? '✅' : v === false ? '❌' : '—');
 const pct = (n) => (Number.isFinite(n) ? `${(+n).toFixed(0)}%` : '—');
 
+// Simple text progress bar for bonding curve %
 function progressBar(pctNum) {
   if (!Number.isFinite(pctNum)) return null;
   const p = Math.max(0, Math.min(100, Number(pctNum)));
@@ -73,24 +74,27 @@ function channelCardText({
   // caller
   user,
   totals, // { totalCalls, totalX, avgX }
+
   // token
   name,
   tkr,
   chain,
   mintOrCa,
+
   // market
   stats, // { mc, lp, vol24h }
+
   // meta
   createdOnName, // e.g. "PumpFun" / "Raydium" / "DEX"
   createdOnUrl,
-  dexPaid, // boolean/undefined
-  curveProgress, // number 0..100 (optional; when Pump.fun)
-  bubblemapUrl, // optional (EVM only)
-  burnPct,     // number percent (0-100) or undefined
-  freezeAuth,  // boolean/undefined
-  mintAuth,    // boolean/undefined
-  twitterUrl,  // optional
-  botUsername, // required
+  dexPaid,            // boolean/undefined
+  curveProgress,      // number 0..100 (optional; when Pump.fun)
+  bubblemapUrl,       // optional (EVM only)
+  burnPct,            // number percent (0-100) or undefined
+  freezeAuth,         // boolean/undefined
+  mintAuth,           // boolean/undefined
+  twitterUrl,         // optional
+  botUsername,        // required
 }) {
   const titleName = name ? esc(name) : 'Token';
   const ticker = tkr ? esc(tkr) : '';
@@ -99,11 +103,13 @@ function channelCardText({
       ? `<a href="${createdOnUrl}">${esc(createdOnName || 'DEX')}</a>`
       : esc(createdOnName || 'DEX');
 
+  const x = (n) => (Number.isFinite(n) ? `${n.toFixed(1)}X` : '—');
+
   const totalsBlock =
 `Call by @${esc(user)}
 Total Calls: ${totals?.totalCalls ?? 0}
-Total X: ${Number.isFinite(totals?.totalX) ? `${totals.totalX.toFixed(1)}X` : '—'}
-Average X per call:  ${Number.isFinite(totals?.avgX) ? `${totals.avgX.toFixed(1)}X` : '—'}
+Total X: ${x(totals?.totalX)}
+Average X per call:  ${x(totals?.avgX)}
 `;
 
   const curveLine = (() => {

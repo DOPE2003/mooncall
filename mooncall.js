@@ -87,11 +87,11 @@ function phantomPayLink(recipient, amount, label, message) {
   return `${base}?${q.toString()}`;
 }
 
-// Best-effort Pump.fun bonding-curve % fetch
+// Best-effort Pump.fun bonding-curve % fetch (SOL)
 async function fetchPumpfunProgress(mint) {
   try {
     const clean = String(mint || '').replace(/pump$/i, '');
-    // Primary JSON endpoint
+    // JSON endpoint
     let r = await fetch(`https://pump.fun/api/data/${clean}`, { headers: { accept: 'application/json' } });
     if (r.ok) {
       const j = await r.json();
@@ -108,8 +108,7 @@ async function fetchPumpfunProgress(mint) {
         return Math.max(0, Math.min(100, pct));
       }
     }
-
-    // Fallback: scrape coin HTML for a numeric value in embedded state
+    // HTML fallback
     r = await fetch(`https://pump.fun/coin/${clean}`, { headers: { accept: 'text/html' } });
     if (!r.ok) return null;
     const html = await r.text();
@@ -408,7 +407,7 @@ bot.on('text', async (ctx) => {
   const createdOnName = info.dex || info.dexName || 'DEX';
   const looksPump = chainUpper === 'SOL' && (/pumpfun/i.test(createdOnName) || /pump$/i.test(raw));
   if (looksPump) {
-    try { curveProgress = await fetchPumpfunProgress(caOrMint); } catch {} // ignore errors
+    try { curveProgress = await fetchPumpfunProgress(caOrMint); } catch {}
   }
 
   // bubblemap (EVM only)
