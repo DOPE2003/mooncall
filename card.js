@@ -1,7 +1,27 @@
 // card.js
-// Channel "New Call" card + inline keyboards.
+// Rich channel card + inline keyboards.
 const { Markup } = require('telegraf');
 const { usd } = require('./lib/price');
+
+// HTML esc (safe for parse_mode:'HTML')
+const esc = (s = '') =>
+  String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+
+const boolIcon = (v) => (v === true ? '✅' : v === false ? '❌' : '—');
+const pct = (n) => (Number.isFinite(n) ? `${(+n).toFixed(0)}%` : '—');
+
+function progressBar(pctNum) {
+  if (!Number.isFinite(pctNum)) return null;
+  const p = Math.max(0, Math.min(100, Number(pctNum)));
+  const total = 22;
+  const filled = Math.round((p / 100) * total);
+  return `${'▮'.repeat(filled)}${'▯'.repeat(total - filled)} ${p.toFixed(1)}%`;
+}
 
 // Parse env list like: "📊 Axiom|https://t.me/axiom_app_bot,🐴 Trojan|https://..."
 function parseTradeBots(envVar) {
@@ -15,23 +35,14 @@ function parseTradeBots(envVar) {
     });
 }
 
-/** Make a simple text progress bar (20 chars). */
-function progressBar(pct) {
-  if (pct == null || !isFinite(pct)) return null;
-  const p = Math.max(0, Math.min(100, Number(pct)));
-  const total = 20;
-  const filled = Math.round((p / 100) * total);
-  return `${'▮'.repeat(filled)}${'▯'.repeat(total - filled)} ${p.toFixed(1)}%`;
-}
-
 /**
- * Inline keyboard under a channel post:
+ * Inline keyboard under a channel post
  *  - Row 1: Chart + Boost
  *  - Next rows: trade bots from env per chain
  */
 function tradeKeyboards(chain, chartUrl) {
   const bots =
-    chain === 'SOL'
+    String(chain).toUpperCase() === 'SOL'
       ? parseTradeBots(process.env.TRADE_BOTS_SOL)
       : parseTradeBots(process.env.TRADE_BOTS_BSC);
 
@@ -56,86 +67,78 @@ function tradeKeyboards(chain, chartUrl) {
 }
 
 /**
- * Channel caption. CA is inline, in a code span so it’s easy to copy.
+ * Rich channel caption (copyable CA “└ <code>CA</code>”)
  */
 function channelCardText({
+  // caller
   user,
-  totals,                 // { totalCalls, totalX, avgX }
+  totals, // { totalCalls, totalX, avgX }
+  // token
   name,
   tkr,
   chain,
   mintOrCa,
-  stats,                  // { mc, lp, vol24h }
-  createdOnName,          // e.g., 'PumpFun', 'Raydium', 'DEX'
+  // market
+  stats, // { mc, lp, vol24h }
+  // meta
+  createdOnName, // e.g. "PumpFun" / "Raydium" / "DEX"
   createdOnUrl,
-  curveProgress,          // 0..100 (optional)
-  dexPaid,                // boolean (optional)
-  bubblemapUrl,           // url (optional)
-  burnPct,                // number (optional)
-  freezeAuth,             // boolean (optional)
-  mintAuth,               // boolean (optional)
-  websiteUrl,             // (optional)
-  twitterUrl,             // (optional)
-  chartUrl,               // (optional)
-  botUsername,
+  dexPaid, // boolean/undefined
+  curveProgress, // number 0..100 (optional; when Pump.fun)
+  bubblemapUrl, // optional (EVM only)
+  burnPct,     // number percent (0-100) or undefined
+  freezeAuth,  // boolean/undefined
+  mintAuth,    // boolean/undefined
+  twitterUrl,  // optional
+  botUsername, // required
 }) {
-  const titleName = name ? `${name} ` : '';
-  const ticker = tkr ? `($${tkr})` : '';
-  const totalsLine =
-    totals
-      ? `Total Calls: <b>${totals.totalCalls || 0}</b>\n` +
-        `Total X: <b>${(totals.totalX || 0).toFixed(1)}X</b>\n` +
-        `Average X per call:  <b>${(totals.avgX || 0).toFixed(1)}X</b>\n\n`
-      : '';
+  const titleName = name ? esc(name) : 'Token';
+  const ticker = tkr ? esc(tkr) : '';
+  const createdOn =
+    createdOnUrl
+      ? `<a href="${createdOnUrl}">${esc(createdOnName || 'DEX')}</a>`
+      : esc(createdOnName || 'DEX');
 
-  // Bonding curve shows if (1) we have a value OR (2) it looks like Pump.fun
-  const looksPump = /pumpfun/i.test(String(createdOnName || '')) || /pump$/.test(mintOrCa);
-  const curveLine = looksPump
-    ? (() => {
-        const bar = progressBar(curveProgress);
-        if (bar) {
-          return `📊 <b>Bonding Curve Progression</b>: ${bar}\n`;
-        }
-        return `📊 <b>Bonding Curve Progression</b>: —\n`;
-      })()
-    : '';
+  const totalsBlock =
+`Call by @${esc(user)}
+Total Calls: ${totals?.totalCalls ?? 0}
+Total X: ${Number.isFinite(totals?.totalX) ? `${totals.totalX.toFixed(1)}X` : '—'}
+Average X per call:  ${Number.isFinite(totals?.avgX) ? `${totals.avgX.toFixed(1)}X` : '—'}
+`;
 
-  const dexPaidLine =
-    dexPaid === true ? '✅' : dexPaid === false ? '❌' : '—';
+  const curveLine = (() => {
+    // Show the line only if it's Pump.fun or we have a value
+    const isPump = /pumpfun/i.test(String(createdOnName || '')) || /pump$/i.test(String(mintOrCa || ''));
+    if (!isPump && !Number.isFinite(curveProgress)) return '';
+    const bar = progressBar(curveProgress);
+    return `📊 Bonding Curve Progression: ${bar || '—'}\n`;
+  })();
 
-  const burnLine = typeof burnPct === 'number' ? `${burnPct.toFixed(0)}% ${burnPct >= 99 ? '✅' : ''}` : '—';
-  const freezeLine = freezeAuth === true ? '✅' : freezeAuth === false ? '❌' : '—';
-  const mintLine = mintAuth === true ? '✅' : mintAuth === false ? '❌' : '—';
+  const bubbleLine = bubblemapUrl
+    ? `🫧 <a href="${bubblemapUrl}">Bubblemap</a>`
+    : `🫧 Bubblemap`;
 
-  const links = [
-    twitterUrl ? 'Twitter' : null,
-    websiteUrl ? 'Website' : null,
-  ].filter(Boolean).join(' | ');
-
-  const linkLines = [
-    websiteUrl ? `<a href="${websiteUrl}">Website</a>` : null,
-    twitterUrl ? `<a href="${twitterUrl}">Twitter</a>` : null,
-  ].filter(Boolean).join(' | ');
-
-  const bottomSearch =
-    (tkr ? `🔎 $${tkr}` : '🔎 Token') + ' - ' + '🔎 <code>CA</code>';
+  const twitterLine = twitterUrl ? `<a href="${twitterUrl}">Twitter</a>` : 'Twitter';
 
   return (
-    `Call by @${user}\n` +
-    totalsLine +
-    `🌕 ${titleName}${ticker}\n` +
-    `└<code>${mintOrCa}</code>\n\n` +
-    `🏦 <b>Market Cap:</b> ${usd(stats.mc)}\n` +
-    `🛠 <b>Created On:</b> ${createdOnUrl ? `<a href="${createdOnUrl}">${createdOnName || 'DEX'}</a>` : (createdOnName || 'DEX')}\n` +
-    curveLine +
-    `🦅 <b>DexS Paid?</b>: ${dexPaidLine}\n\n` +
-    `🫧 <b>Bubblemap</b>${bubblemapUrl ? ` — <a href="${bubblemapUrl}">Open</a>` : ''}\n` +
-    `🔥 <b>Liquidity Burned:</b> ${burnLine}\n` +
-    `❄️ <b>Freeze Authority:</b> ${freezeLine}\n` +
-    `➕ <b>Mint Authority:</b> ${mintLine}\n\n` +
-    (linkLines ? `${linkLines}\n\n` : '') +
-    `${tkr ? `🔎 $${tkr}` : '🔎 Token'} - 🔎 <code>CA</code>\n\n` +
-    `Make a call here 👉 @${botUsername}`
+`${totalsBlock}
+🪙 ${titleName}${ticker ? ` ($${ticker})` : ''}
+└<code>${esc(mintOrCa)}</code>
+
+🏦 Market Cap: ${usd(stats?.mc)}
+🛠 Created On: ${createdOn}
+${curveLine}🦅 DexS Paid?: ${boolIcon(dexPaid)}
+
+${bubbleLine}
+🔥 Liquidity Burned: ${pct(burnPct)} ${boolIcon(burnPct === 100)}
+❄️ Freeze Authority: ${boolIcon(freezeAuth)}
+➕ Mint Authority: ${boolIcon(mintAuth)}
+
+${twitterLine}
+
+🔍${ticker ? `$${ticker}` : ''} - 🔍CA
+
+Make a call here 👉 @${esc(botUsername)}`
   );
 }
 
