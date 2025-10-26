@@ -77,7 +77,7 @@ function rocketAlert({ tkr, ca, xNow, entryMc, nowMc, byUser, hours }) {
 
   return (
     `${rockets} <b>${tag}</b> <b>soared by X${xNow.toFixed(2)}</b> in <b>${dur}</b> since call! 🚀🌕\n\n` +
-    `📞 MC when called: <b>${usd(entryMc)}</b>${byUser ? ` by @${byUser}` : ''}\n` +
+    `📞 MC when called: <b>${usd(entryMc)}</b>${byUser ? ` by @${byUser}` : ''}\n\n` +
     `🏆 MC now: <b>${usd(nowMc)}</b>`
   );
 }
@@ -89,8 +89,8 @@ function moonAlert({ tkr, entryMc, nowMc, xNow, byUser, hours }) {
   const dur = humanDuration(hours);
   return (
     `🌕🌖 <b>${tag}</b> <b>${xNow.toFixed(2)}x</b> | ` +
-    `💹From <b>${usd(entryMc).replace('$','')}</b> ↗️ <b>${usd(nowMc).replace('$','')}</b> • <b>${dur}</b> since call` +
-    (byUser ? ` — called by @${byUser}` : '')
+    `💹From <b>${usd(entryMc).replace('$','')}</b> ↗️ <b>${usd(nowMc).replace('$','')}</b> \n\n <b>${dur}</b> since call` +
+    (byUser ? ` \n\n called by @${byUser}` : '')
   );
 }
 
