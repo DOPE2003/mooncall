@@ -79,40 +79,58 @@ function channelCardText({
   chain,
   mintOrCa,
   // market
-  stats, // { mc, lp, vol24h }
+  stats, // { mc, lp, vol24h, priceUsd? }
   // meta
-  createdOnName, // e.g. "PumpFun" / "Raydium" / "DEX"
+  createdOnName,     // e.g. "PumpFun" / "Raydium" / "DEX"
   createdOnUrl,
-  dexPaid, // boolean/undefined
-  curveProgress, // number 0..100 (optional; when Pump.fun)
-  bubblemapUrl, // optional (EVM only)
-  burnPct,     // number percent (0-100) or undefined
-  freezeAuth,  // boolean/undefined
-  mintAuth,    // boolean/undefined
-  twitterUrl,  // optional
-  botUsername, // required
+  dexPaid,           // boolean/undefined (promoted/paid listing on DexScreener)
+  curveProgress,     // number 0..100 (optional; when Pump.fun)
+  bubblemapUrl,      // optional (EVM only)
+  burnPct,           // number percent (0-100) or undefined
+  freezeAuth,        // boolean/undefined
+  mintAuth,          // boolean/undefined
+  twitterUrl,        // optional
+  botUsername,       // required
 }) {
   const titleName = name ? esc(name) : 'Token';
   const ticker = tkr ? esc(tkr) : '';
+  const ch = String(chain || '').toUpperCase();
+
   const createdOn =
     createdOnUrl
       ? `<a href="${createdOnUrl}">${esc(createdOnName || 'DEX')}</a>`
       : esc(createdOnName || 'DEX');
 
   const totalsBlock =
-`Call by @${esc(user)}
-Total Calls: ${totals?.totalCalls ?? 0}
-Total X: ${Number.isFinite(totals?.totalX) ? `${totals.totalX.toFixed(1)}X` : '—'}
-Average X per call:  ${Number.isFinite(totals?.avgX) ? `${totals.avgX.toFixed(1)}X` : '—'}
-`;
+`👤 Call by <b>@${esc(user)}</b>
+📊 Total Calls: <b>${totals?.totalCalls ?? 0}</b>
+📈 Total X: <b>${Number.isFinite(totals?.totalX) ? `${totals.totalX.toFixed(2)}×` : '—'}</b>
+📐 Average X/call:  <b>${Number.isFinite(totals?.avgX) ? `${totals.avgX.toFixed(2)}×` : '—'}</b>`;
 
+  const priceLine = Number.isFinite(stats?.priceUsd)
+    ? `💲 Price: <b>${usd(stats.priceUsd).replace('$','')} USD</b>\n`
+    : '';
+
+  const mcLine   = `🏦 Market Cap: <b>${usd(stats?.mc)}</b>`;
+  const lpLine   = `💧 LP: <b>${usd(stats?.lp)}</b>`;
+  const volLine  = `📈 24h Vol: <b>${usd(stats?.vol24h)}</b>`;
+
+  // Bonding curve line:
   const curveLine = (() => {
-    // Show the line only if it's Pump.fun or we have a value
     const isPump = /pumpfun/i.test(String(createdOnName || '')) || /pump$/i.test(String(mintOrCa || ''));
     if (!isPump && !Number.isFinite(curveProgress)) return '';
+    if (!Number.isFinite(curveProgress)) {
+      // hint while fallback fetch runs (no auto-refresh here; worker/bot would need to edit the message)
+      return `📊 Bonding Curve Progression: ⏳ fetching…\n`;
+    }
     const bar = progressBar(curveProgress);
     return `📊 Bonding Curve Progression: ${bar || '—'}\n`;
   })();
+
+  // Dexscreener “paid/promoted” status — make it visually explicit
+  const dexStatus = (dexPaid === true)
+    ? '🟢 <b>Promoted (Paid)</b>'
+    : (dexPaid === false ? '⚪ Not Promoted' : '—');
 
   const bubbleLine = bubblemapUrl
     ? `🫧 <a href="${bubblemapUrl}">Bubblemap</a>`
@@ -122,21 +140,24 @@ Average X per call:  ${Number.isFinite(totals?.avgX) ? `${totals.avgX.toFixed(1)
 
   return (
 `${totalsBlock}
-🪙 ${titleName}${ticker ? ` ($${ticker})` : ''}
+
+🪙 <b>${titleName}${ticker ? ` ($${ticker})` : ''}</b> • <b>${ch}</b>
 └<code>${esc(mintOrCa)}</code>
 
-🏦 Market Cap: ${usd(stats?.mc)}
-🛠 Created On: ${createdOn}
-${curveLine}🦅 DexS Paid?: ${boolIcon(dexPaid)}
+${priceLine}${mcLine}
+${lpLine}
+${volLine}
+🛠 Created On: <b>${createdOn}</b>
+${curveLine}🦅 Dexscreener Status: ${dexStatus}
 
 ${bubbleLine}
-🔥 Liquidity Burned: ${pct(burnPct)} ${boolIcon(burnPct === 100)}
+🔥 Liquidity Burned: <b>${pct(burnPct)}</b> ${boolIcon(burnPct === 100)}
 ❄️ Freeze Authority: ${boolIcon(freezeAuth)}
 ➕ Mint Authority: ${boolIcon(mintAuth)}
 
 ${twitterLine}
 
-🔍${ticker ? `$${ticker}` : ''} - 🔍CA
+🔍 ${ticker ? `$${ticker}` : ''} • 🔍 CA
 
 Make a call here 👉 @${esc(botUsername)}`
   );

@@ -8,6 +8,12 @@ const PremiumUser = require('./model/premium.model');
 const { getTokenInfo, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
 
+// --- fetch polyfill (Node < 18) ---------------------------------------------
+const doFetch =
+  typeof fetch !== 'undefined'
+    ? fetch
+    : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
 // --- env / constants ---------------------------------------------------------
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
@@ -91,8 +97,9 @@ function phantomPayLink(recipient, amount, label, message) {
 async function fetchPumpfunProgress(mint) {
   try {
     const clean = String(mint || '').replace(/pump$/i, '');
+
     // JSON endpoint
-    let r = await fetch(`https://pump.fun/api/data/${clean}`, { headers: { accept: 'application/json' } });
+    let r = await doFetch(`https://pump.fun/api/data/${clean}`, { headers: { accept: 'application/json' } });
     if (r.ok) {
       const j = await r.json();
       let pct =
@@ -109,7 +116,7 @@ async function fetchPumpfunProgress(mint) {
       }
     }
     // HTML fallback
-    r = await fetch(`https://pump.fun/coin/${clean}`, { headers: { accept: 'text/html' } });
+    r = await doFetch(`https://pump.fun/coin/${clean}`, { headers: { accept: 'text/html' } });
     if (!r.ok) return null;
     const html = await r.text();
     const m = html.match(/"bonding(?:_curve_|Curve)progress"\s*:\s*([0-9.]+)/i)
@@ -144,7 +151,7 @@ function makeBubblemapUrl(chainUpper, ca) {
 // --- UI: /start --------------------------------------------------------------
 bot.start(async (ctx) => {
   await ctx.reply(
-    'Welcome to 🌖 Mooncall bot 🌖 .\n\n' +
+    'Welcome to 🌕 Mooncall bot 🌕 .\n\n' +
       'Call tokens, track PnL, and compete for rewards.\n\n' +
       '» Each user can make 1 call per day\n' +
       '» Calls are tracked by PnL performance\n' +
@@ -186,21 +193,43 @@ bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
   bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)))
 );
 
-// Make a call
-bot.action('cmd:make', async (ctx) => {
-  await ctx.answerCbQuery();
+// --- Slash command mirrors ---------------------------------------------------
+function promptMakeCall(ctx) {
   awaitingCA.add(String(ctx.from.id));
-  await ctx.reply(
+  return ctx.reply(
     'Paste the token address now:\n' +
-    '• SOL: base58 (suffix “…pump” is OK)\n' +
-    '• BSC: 0x + 40 hex',
+    '• SOL: is accepted\n' +
+    '• BSC: is accepted 🆕🆕',
     { parse_mode: 'HTML' }
   );
-});
+}
+bot.action('cmd:make', async (ctx) => (await ctx.answerCbQuery(), promptMakeCall(ctx)));
+bot.command('make', promptMakeCall);
+bot.command('rules', (ctx) => ctx.reply(
+  '📜 <b>Rules</b>\n\n' +
+  '• One call per user in 24h (admins are exempt).\n' +
+  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
+  '• We track PnLs & post milestone alerts.\n' +
+  '• Best performers climb the leaderboard.', { parse_mode:'HTML' }));
+bot.command('help', (ctx) => ctx.reply(
+  'Commands:\n' +
+  '/start – open menu\n' +
+  '/make – make a call\n' +
+  '/leaders – top callers\n' +
+  '/mycalls – list your last 10 calls\n' +
+  '/rules – rules\n' +
+  '/subscribe – premium info\n' +
+  '/ping – check bot', { parse_mode:'HTML' }));
+bot.command('ping', (ctx) => ctx.reply('pong ✅'));
 
 // PREMIUM: Subscribe
 bot.action('cmd:subscribe', async (ctx) => {
   await ctx.answerCbQuery();
+  return handleSubscribe(ctx);
+});
+bot.command('subscribe', handleSubscribe);
+
+async function handleSubscribe(ctx) {
   if (!PREMIUM_SOL_WALLET) {
     return ctx.reply('Premium is temporarily unavailable. Please try again later.');
   }
@@ -226,8 +255,9 @@ bot.action('cmd:subscribe', async (ctx) => {
     'If you can’t find your signature, tap “I Paid ✅” and we’ll review it.',
     { parse_mode: 'HTML', ...kb }
   );
-});
+}
 
+// "I Paid" + txsig
 bot.action('premium:paid', async (ctx) => {
   await ctx.answerCbQuery();
   const tgId = String(ctx.from.id);
@@ -259,21 +289,39 @@ bot.action('premium:txsig', async (ctx) => {
   );
 });
 
-// Leaderboard
+// --- Leaderboard (exclude admins) -------------------------------------------
 bot.action('cmd:leaders', async (ctx) => {
   try {
     await ctx.answerCbQuery();
+
+    // Ensure admin IDs are strings (they already are, but be explicit)
+    const ADMIN_ID_LIST = ADMIN_IDS.map(String);
+
     const rows = await Call.aggregate([
+      // 1) exclude admin callers by tgId
+      { $match: { 'caller.tgId': { $nin: ADMIN_ID_LIST } } },
+
+      // 2) compute x = peak / entry for each call (only valid data)
       { $project: { user: '$caller.username', tgId: '$caller.tgId', entry: '$entryMc', peak: '$peakMc' } },
       { $match: { entry: { $gt: 0 }, peak: { $gt: 0 } } },
       { $project: { user: 1, tgId: 1, x: { $divide: ['$peak', '$entry'] } } },
+
+      // 3) sum X per caller
       { $group: { _id: { user: '$user', tgId: '$tgId' }, sumX: { $sum: '$x' } } },
       { $sort: { sumX: -1 } },
       { $limit: 10 },
     ]);
-    if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
+
+    if (!rows.length) {
+      return ctx.reply('No leaderboard data yet — make a call!');
+    }
+
     const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-    const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
+    const lines = rows.map((r, i) => {
+      const handle = r._id.user || r._id.tgId; // fallback if username missing
+      return `${medal(i)} @${handle} — ${r.sumX.toFixed(2)}× total`;
+    });
+
     await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) {
     console.error(e);
@@ -281,10 +329,13 @@ bot.action('cmd:leaders', async (ctx) => {
   }
 });
 
-// My calls
-bot.action('cmd:mycalls', async (ctx) => {
+
+// My calls (button + /mycalls)
+bot.action('cmd:mycalls', myCallsHandler);
+bot.command('mycalls', myCallsHandler);
+async function myCallsHandler(ctx) {
   try {
-    await ctx.answerCbQuery();
+    if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
     const list = await Call.find({ 'caller.tgId': tgId }).sort({ createdAt: -1 }).limit(10);
     if (!list.length) return ctx.reply('You have no calls yet.');
@@ -296,7 +347,7 @@ bot.action('cmd:mycalls', async (ctx) => {
     });
     await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode:'HTML' });
   } catch (e) { console.error(e); }
-});
+}
 
 // Text intake (tx sig OR call)
 bot.on('text', async (ctx) => {
