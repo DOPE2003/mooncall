@@ -154,6 +154,24 @@ function makeBubblemapUrl(chainUpper, ca) {
   return key ? `https://app.bubblemaps.io/token/${key}/${ca}` : null;
 }
 
+// --- totals helper used by cards (filters out excluded calls) ---------------
+async function getUserTotalsForCards(tgId) {
+  const calls = await Call.find({
+    'caller.tgId': String(tgId),
+    entryMc: { $gt: 0 },
+    peakMc: { $gt: 0 },
+    $or: [
+      { excludedFromLeaderboard: { $exists: false } },
+      { excludedFromLeaderboard: { $ne: true } }
+    ],
+  }).lean();
+
+  const totalCalls = calls.length;
+  const totalX = calls.reduce((sum, c) => sum + (c.peakMc / c.entryMc), 0);
+  const avgX = totalCalls ? totalX / totalCalls : 0;
+  return { totalCalls, totalX, avgX };
+}
+
 // --- UI: /start --------------------------------------------------------------
 bot.start(async (ctx) => {
   await ctx.reply(
@@ -548,15 +566,8 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // caller totals
-  const userCalls = await Call.find({ 'caller.tgId': tgId });
-  const totalCalls = userCalls.length;
-  const totalX = userCalls.reduce((sum, c) => {
-    if (!c.entryMc || c.entryMc <= 0) return sum;
-    const peak = c.peakMc || c.entryMc;
-    return sum + peak / c.entryMc;
-  }, 0);
-  const avgX = totalCalls ? totalX / totalCalls : 0;
+  // caller totals (FILTERED like leaderboard)
+  const { totalCalls, totalX, avgX } = await getUserTotalsForCards(tgId);
 
   // urls
   const chartUrl =
