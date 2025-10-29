@@ -408,6 +408,60 @@ bot.command('capx', async (ctx) => {
   await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×.`);
 });
 
+// NEW: Set a user's TOTAL X to a target by trimming biggest calls first
+bot.command('settotalx', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const parts = (ctx.message.text || '').split(' ').slice(1);
+  if (parts.length < 2) return ctx.reply('Usage: /settotalx <@username | tgId> <targetX>');
+
+  const target = Number(parts.pop());
+  const who = parts.join(' ').trim();
+  if (!Number.isFinite(target) || target <= 0) return ctx.reply('targetX must be a positive number.');
+
+  const username = who.startsWith('@') ? who.slice(1) : null;
+  const q = username ? { 'caller.username': username } : { 'caller.tgId': String(who) };
+
+  const docs = await Call.find({ ...q, entryMc: { $gt: 0 }, peakMc: { $gt: 0 } }).exec();
+  if (!docs.length) return ctx.reply('No calls found for that user.');
+
+  // Build rows sorted by contribution (largest first)
+  const rows = docs.map(d => ({ _id: d._id, entry: d.entryMc, peak: d.peakMc, x: d.peakMc / d.entryMc }))
+                   .sort((a,b)=> b.x - a.x);
+
+  let current = rows.reduce((s,r)=> s + r.x, 0);
+  if (current <= target + 1e-9) {
+    return ctx.reply(`User is already at ${current.toFixed(2)}× ≤ target ${target}×.`);
+  }
+
+  // Reduce biggest contributions first; don't push any call below 1×
+  for (const r of rows) {
+    if (current <= target) break;
+    const maxReduce = Math.max(0, r.x - 1);       // cannot go below 1×
+    const need = current - target;
+    const delta = Math.min(maxReduce, need);
+    if (delta <= 0) continue;
+    r.x -= delta;
+    r.peak = r.entry * r.x;
+    current -= delta;
+  }
+
+  // Persist only decreases to peak/last
+  let changed = 0;
+  for (const r of rows) {
+    const doc = docs.find(d => String(d._id) === String(r._id));
+    if (!doc) continue;
+    const newPeak = Math.min(doc.peakMc, r.peak);
+    if (newPeak < doc.peakMc - 1e-9) {
+      doc.peakMc = newPeak;
+      if (doc.lastMc > newPeak) doc.lastMc = newPeak;
+      await doc.save();
+      changed++;
+    }
+  }
+
+  await ctx.reply(`✅ Set total X for ${who} to ≈ ${current.toFixed(2)}× (updated ${changed} call(s)).`);
+});
+
 // Text intake (tx sig OR call)
 bot.on('text', async (ctx) => {
   const tgId = String(ctx.from.id);
