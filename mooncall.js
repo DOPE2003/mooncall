@@ -289,46 +289,29 @@ bot.action('premium:txsig', async (ctx) => {
   );
 });
 
-// --- Leaderboard (exclude admins) -------------------------------------------
-bot.action('cmd:leaders', async (ctx) => {
+// Leaderboard (button + /leaders)
+bot.action('cmd:leaders', leadersHandler);
+bot.command('leaders', leadersHandler);
+async function leadersHandler(ctx) {
   try {
-    await ctx.answerCbQuery();
-
-    // Ensure admin IDs are strings (they already are, but be explicit)
-    const ADMIN_ID_LIST = ADMIN_IDS.map(String);
-
+    if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
     const rows = await Call.aggregate([
-      // 1) exclude admin callers by tgId
-      { $match: { 'caller.tgId': { $nin: ADMIN_ID_LIST } } },
-
-      // 2) compute x = peak / entry for each call (only valid data)
       { $project: { user: '$caller.username', tgId: '$caller.tgId', entry: '$entryMc', peak: '$peakMc' } },
       { $match: { entry: { $gt: 0 }, peak: { $gt: 0 } } },
       { $project: { user: 1, tgId: 1, x: { $divide: ['$peak', '$entry'] } } },
-
-      // 3) sum X per caller
       { $group: { _id: { user: '$user', tgId: '$tgId' }, sumX: { $sum: '$x' } } },
       { $sort: { sumX: -1 } },
       { $limit: 10 },
     ]);
-
-    if (!rows.length) {
-      return ctx.reply('No leaderboard data yet — make a call!');
-    }
-
+    if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
     const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-    const lines = rows.map((r, i) => {
-      const handle = r._id.user || r._id.tgId; // fallback if username missing
-      return `${medal(i)} @${handle} — ${r.sumX.toFixed(2)}× total`;
-    });
-
+    const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
     await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) {
     console.error(e);
     await ctx.reply('Failed to load leaderboard.');
   }
-});
-
+}
 
 // My calls (button + /mycalls)
 bot.action('cmd:mycalls', myCallsHandler);
