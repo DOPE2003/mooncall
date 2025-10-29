@@ -8,6 +8,8 @@
     "worker": "node worker.js"
   },
   "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
     "axios": "^1.7.7",
     "dotenv": "^16.4.5",
     "mongoose": "^8.6.0",
