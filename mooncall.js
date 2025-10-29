@@ -577,10 +577,14 @@ bot.on('text', async (ctx) => {
       : `https://dexscreener.com/bsc/${encodeURIComponent(caOrMint)}`);
   const tradeUrl = info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl;
 
-  // bonding curve (Pump.fun only)
+  // bonding curve (Pump.fun only) — broaden detection to include “pumpswap” & …pump
   let curveProgress = null;
   const createdOnName = info.dex || info.dexName || 'DEX';
-  const looksPump = chainUpper === 'SOL' && ((/pumpfun/i.test(createdOnName)) || (/pump$/i.test(raw)));
+  const looksPump = chainUpper === 'SOL' && (
+    /\bpump(fun|swap)?\b/i.test(String(createdOnName || '')) ||
+    /\bpump$/i.test(String(raw || '')) ||
+    /\bpump$/i.test(String(caOrMint || ''))
+  );
   if (looksPump) {
     try { curveProgress = await fetchPumpfunProgress(caOrMint); } catch {}
   }
