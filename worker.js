@@ -1,4 +1,6 @@
 // worker.js
+'use strict';
+
 require('dotenv').config();
 require('./lib/db');
 
@@ -8,11 +10,11 @@ const { getTokenInfo, usd } = require('./lib/price');
 const { tradeKeyboards } = require('./card');
 
 const tg = new Telegram(process.env.BOT_TOKEN);
-const CH_ID = Number(process.env.ALERTS_CHANNEL_ID);
+const CH_ID = Number(process.env.ALERTS_CHANNEL_ID || 0);
 
-// ---- Config ---------------------------------------------------------------
-const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 1);  // poll loop
-const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);         // how long to track calls
+// ── Config ───────────────────────────────────────────────────────────────────
+const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 1);   // poll loop
+const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);          // how long to track calls
 
 // Low-tier milestones (<10×)
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
@@ -26,23 +28,23 @@ const HIGH_START = Number(process.env.HIGH_START || 10);
 const HIGH_STEP  = Number(process.env.HIGH_STEP  || 10);   // 10=10x,20x,... | 1=10x,11x,...
 const HIGH_MAX   = Number(process.env.HIGH_MAX   || 5000);
 
-// Anti-MEV & quality guards (tune in .env)
-const MIN_LP_USD       = Number(process.env.MIN_LP_USD || 1000);   // require minimum LP
-const MIN_VOL5M_USD    = Number(process.env.MIN_VOL5M_USD || 0);   // if getTokenInfo supplies vol5m
-const MIN_VOL24H_USD   = Number(process.env.MIN_VOL24H_USD || 0);  // fallback if no vol5m
-const MIN_AGE_MIN      = Number(process.env.MIN_AGE_MIN || 0);     // token age (minutes) before alerts
-const CONFIRM_SECONDS  = Number(process.env.CONFIRM_SECONDS || 60);// second pass must still be true
+// Anti-MEV / quality guards (tune in .env)
+const MIN_LP_USD       = Number(process.env.MIN_LP_USD || 2000);     // min liquidity
+const MIN_VOL5M_USD    = Number(process.env.MIN_VOL5M_USD || 500);   // prefer 5-minute volume
+const MIN_VOL24H_USD   = Number(process.env.MIN_VOL24H_USD || 0);    // fallback if no 5m
+const MIN_AGE_MIN      = Number(process.env.MIN_AGE_MIN || 0);       // token age (minutes) before alerts
+const CONFIRM_SECONDS  = Number(process.env.CONFIRM_SECONDS || 60);  // must still hold after N seconds
 
-// tolerance for threshold checks so we don’t miss by a hair
+// tolerance so we don’t miss by a hair
 const EPS = 0.01;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const NOW = () => new Date();
 
-// For two-tick confirmations without DB writes
-// key = `${callId}:${milestone}`
+// For two-tick confirmations (no DB writes). key = `${callId}:${milestone}`
 const pendingConfirms = new Map();
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
 function hoursBetween(a, b) {
   return Math.max(0, (b - a) / 36e5);
 }
@@ -55,7 +57,6 @@ function humanDuration(h) {
   const hr = Math.round(h);
   return `${hr} hour${hr === 1 ? '' : 's'}`;
 }
-
 function collectLowTierHits(xNow, already) {
   const hits = [];
   for (const m of MILESTONES) {
@@ -72,16 +73,15 @@ function collectHighTierHits(xNow, already) {
   }
   return hits;
 }
-
 function shortenCa(ca) {
   if (!ca || typeof ca !== 'string') return 'Token';
   if (ca.length <= 8) return ca;
   return `${ca.slice(0, 4)}…${ca.slice(-4)}`;
 }
 
-// ---- Guards / Anti-MEV -----------------------------------------------------
+// ── Guards / Anti-MEV ────────────────────────────────────────────────────────
 function passQualityGuards(info, callDoc) {
-  // LP
+  // Liquidity
   if (MIN_LP_USD > 0 && Number.isFinite(info.lp) && info.lp < MIN_LP_USD) return false;
 
   // Age (minutes) — prefer info.ageMin if supplied, else compute from call time
@@ -90,56 +90,51 @@ function passQualityGuards(info, callDoc) {
     : Math.max(0, (NOW() - callDoc.createdAt) / 60000);
   if (MIN_AGE_MIN > 0 && ageMin < MIN_AGE_MIN) return false;
 
-  // Volume — prefer 5m if present, else 24h if set
+  // Volume — prefer 5m if present, else 24h if configured
   if (MIN_VOL5M_USD > 0 && Number.isFinite(info.vol5m) && info.vol5m < MIN_VOL5M_USD) return false;
   if (MIN_VOL5M_USD <= 0 && MIN_VOL24H_USD > 0 && Number.isFinite(info.vol24h) && info.vol24h < MIN_VOL24H_USD) return false;
 
   return true;
 }
 
-function shouldConfirm(callId, milestone, stillValid) {
+// return true = HOLD (wait); false = OK to POST
+function shouldHoldConfirm(callId, milestone, stillValid, seconds = CONFIRM_SECONDS) {
   const key = `${callId}:${milestone}`;
   const now = Date.now();
   const rec = pendingConfirms.get(key);
 
   if (!rec) {
-    // first hit — start confirmation window, do not alert yet
+    // first hit — start confirmation window
     pendingConfirms.set(key, { first: now });
-    return true; // means "hold; waiting confirm"
+    return true; // hold
   }
 
-  // if window expired, restart
-  if (now - rec.first > Math.max(5 * 60_000, CONFIRM_SECONDS * 1000 * 5)) {
+  // restart window if too old (5× confirm window or at least 5 min)
+  const maxWindow = Math.max(5 * 60_000, seconds * 1000 * 5);
+  if (now - rec.first > maxWindow) {
     pendingConfirms.set(key, { first: now });
     return true;
   }
 
-  // if we are within confirmation window and the condition still holds after CONFIRM_SECONDS => OK to post
-  if (now - rec.first >= CONFIRM_SECONDS * 1000 && stillValid) {
+  // allow post only when the condition still holds after N seconds
+  if ((now - rec.first) >= seconds * 1000 && stillValid) {
     pendingConfirms.delete(key);
-    return false; // do not hold -> allow alert
+    return false; // do not hold -> post
   }
-
-  // keep waiting
-  return true;
+  return true; // keep holding
 }
 
-// ---- Alert text -----------------------------------------------------------
-// <10× — bright, with duration + “by @user” and bold stats lines
+// ── Alert text ───────────────────────────────────────────────────────────────
 function rocketAlert({ tkr, ca, xNow, entryMc, nowMc, byUser, hours }) {
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
   const tag = tkr ? `$${tkr}` : shortenCa(ca);
   const dur = humanDuration(hours);
-
   return (
     `${rockets} <b>${tag}</b> <b>soared by X${xNow.toFixed(2)}</b> in <b>${dur}</b> since call! 🚀🌕\n\n` +
     `📞 MC when called: <b>${usd(entryMc)}</b>${byUser ? ` by @${byUser}` : ''}\n\n` +
     `🏆 MC now: <b>${usd(nowMc)}</b>`
   );
 }
-
-// ≥10× — one-line structure, add duration, bold parts
-// Example: 🌕🌖 $BYND 47.5x | 💹From 60K ↗️ 2.85M • 16h since call — called by @user
 function moonAlert({ tkr, entryMc, nowMc, xNow, byUser, hours }) {
   const tag = tkr ? `$${tkr}` : 'Token';
   const dur = humanDuration(hours);
@@ -151,7 +146,7 @@ function moonAlert({ tkr, entryMc, nowMc, xNow, byUser, hours }) {
   );
 }
 
-// ---- Core check -----------------------------------------------------------
+// ── Core check ───────────────────────────────────────────────────────────────
 async function checkOne(c) {
   // Guard against corrupt docs
   if (!c || !c.entryMc || c.entryMc <= 0) return;
@@ -173,34 +168,36 @@ async function checkOne(c) {
   const xNow = nowMc / c.entryMc;
   const hours = hoursBetween(c.createdAt, NOW());
 
-  // update last/peak (always track)
+  // Update last/peak (always track)
   c.lastMc = nowMc;
   c.peakMc = Math.max(c.peakMc || 0, nowMc);
 
-  // list of already fired multipliers
+  // Already fired multipliers
   const already = Array.isArray(c.multipliersHit) ? [...c.multipliersHit] : [];
 
-  // which thresholds to consider?
-  const lowHits = collectLowTierHits(xNow, already);
+  // Which thresholds to consider?
+  const lowHits  = collectLowTierHits(xNow, already);
   const highHits = collectHighTierHits(xNow, already);
-  let toFire = [...lowHits, ...highHits].sort((a, b) => a - b);
+  const toFire   = [...lowHits, ...highHits].sort((a, b) => a - b);
 
   if (!toFire.length) {
     await c.save();
     return;
   }
 
-  // Quality / anti-MEV guards
+  // Quality / anti-MEV guards (HARD guard: if it fails, skip alerts)
   const qualityOK = passQualityGuards(info, c);
+  if (!qualityOK) {
+    await c.save();
+    return;
+  }
 
-  // For each milestone, apply confirmation window & guards
   for (const m of toFire) {
     try {
       const stillValid = xNow >= m * (1 - EPS);
 
-      // If quality guard fails, we always require confirmation (two ticks)
-      const needConfirm = !qualityOK || shouldConfirm(c._id.toString(), m, stillValid);
-      if (needConfirm) continue; // skip posting this tick
+      // Two-tick confirmation window (prevents fake spikes)
+      if (shouldHoldConfirm(c._id.toString(), m, stillValid)) continue;
 
       const kb = tradeKeyboards(c.chain || info.chain || 'SOL', info.chartUrl);
 
@@ -238,14 +235,15 @@ async function checkOne(c) {
   await c.save();
 }
 
+// ── Runner ───────────────────────────────────────────────────────────────────
 async function runOnce() {
   const since = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
   const calls = await Call.find({
     createdAt: { $gte: since },
-    entryMc: { $gt: 0 },
-    ca: { $type: 'string', $ne: '' },
-    chain: { $in: ['SOL', 'BSC'] },
-  }).limit(1000);
+    entryMc:   { $gt: 0 },
+    ca:        { $type: 'string', $ne: '' },
+    chain:     { $in: ['SOL', 'BSC'] },
+  }).sort({ createdAt: -1 }).limit(1000);
 
   if (!calls.length) return;
   console.log(`🔎 Checking ${calls.length} calls…`);

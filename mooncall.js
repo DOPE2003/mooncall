@@ -30,6 +30,9 @@ const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim();
 const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
 const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();
 
+const LEADERBOARD_HIDE_ADMINS = String(process.env.LEADERBOARD_HIDE_ADMINS || '')
+  .toLowerCase() === 'true';
+
 // for duplicate summary only
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
   .split(',')
@@ -54,6 +57,9 @@ function viewChannelButton(messageId) {
 }
 const highestMilestone = (x) => { let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best; };
 const normalizeCa = (ca, chainUpper) => (chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca);
+
+function isAdminUser(ctx) { return ADMIN_IDS.includes(String(ctx.from.id)); }
+function parseMsgIdFromLink(s='') { const m = String(s).match(/t\.me\/c\/\d+\/(\d+)/i); return m ? Number(m[1]) : null; }
 
 // extract BSC/SOL address (SOL may end with “…pump”)
 function extractAddress(input) {
@@ -216,6 +222,7 @@ bot.command('help', (ctx) => ctx.reply(
   '/start – open menu\n' +
   '/make – make a call\n' +
   '/leaders – top callers\n' +
+  '/leaders_all – top callers (admins included)\n' +
   '/mycalls – list your last 10 calls\n' +
   '/rules – rules\n' +
   '/subscribe – premium info\n' +
@@ -289,28 +296,46 @@ bot.action('premium:txsig', async (ctx) => {
   );
 });
 
-// Leaderboard (button + /leaders)
-bot.action('cmd:leaders', leadersHandler);
-bot.command('leaders', leadersHandler);
-async function leadersHandler(ctx) {
-  try {
-    if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
-    const rows = await Call.aggregate([
-      { $project: { user: '$caller.username', tgId: '$caller.tgId', entry: '$entryMc', peak: '$peakMc' } },
-      { $match: { entry: { $gt: 0 }, peak: { $gt: 0 } } },
-      { $project: { user: 1, tgId: 1, x: { $divide: ['$peak', '$entry'] } } },
-      { $group: { _id: { user: '$user', tgId: '$tgId' }, sumX: { $sum: '$x' } } },
-      { $sort: { sumX: -1 } },
-      { $limit: 10 },
-    ]);
-    if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
-    const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-    const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
-    await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
-  } catch (e) {
-    console.error(e);
-    await ctx.reply('Failed to load leaderboard.');
+// --- Leaderboard helpers -----------------------------------------------------
+function leaderboardPipeline({ hideAdmins = false } = {}) {
+  const matchStages = [
+    { entryMc: { $gt: 0 } },
+    { peakMc: { $gt: 0 } },
+    { $or: [{ excludedFromLeaderboard: { $exists: false } }, { excludedFromLeaderboard: { $ne: true } }] },
+  ];
+  if (hideAdmins && ADMIN_IDS.length) {
+    matchStages.push({ 'caller.tgId': { $nin: ADMIN_IDS.map(String) } });
   }
+  return [
+    { $match: { $and: matchStages } },
+    { $project: { user: '$caller.username', tgId: '$caller.tgId', x: { $divide: ['$peakMc', '$entryMc'] } } },
+    { $group: { _id: { user: '$user', tgId: '$tgId' }, sumX: { $sum: '$x' } } },
+    { $sort: { sumX: -1 } },
+    { $limit: 10 },
+  ];
+}
+
+// Leaderboard (button + /leaders)
+bot.action('cmd:leaders', leadersHandler(false));
+bot.command('leaders', leadersHandler(false));
+bot.command('leaders_all', leadersHandler(true));
+
+function leadersHandler(forceAll) {
+  return async (ctx) => {
+    try {
+      if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
+      const rows = await Call.aggregate(
+        leaderboardPipeline({ hideAdmins: forceAll ? false : LEADERBOARD_HIDE_ADMINS })
+      );
+      if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
+      const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
+      const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
+      await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
+    } catch (e) {
+      console.error(e);
+      await ctx.reply('Failed to load leaderboard.');
+    }
+  };
 }
 
 // My calls (button + /mycalls)
@@ -331,6 +356,57 @@ async function myCallsHandler(ctx) {
     await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode:'HTML' });
   } catch (e) { console.error(e); }
 }
+
+// --- Admin tools to fix MEV spikes -----------------------------------------
+// Toggle exclude/include a call (by channel link or CA)
+bot.command('exclude', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Usage: /exclude <t.me link | CA>');
+  const msgId = parseMsgIdFromLink(arg);
+  const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
+  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: true } });
+  await ctx.reply(`✅ Excluded ${res.modifiedCount} call(s) from leaderboard.`);
+});
+
+bot.command('include', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Usage: /include <t.me link | CA>');
+  const msgId = parseMsgIdFromLink(arg);
+  const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
+  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: false } });
+  await ctx.reply(`✅ Included ${res.modifiedCount} call(s) back in leaderboard.`);
+});
+
+// Cap a call’s contribution to X (e.g., clamp at 200×)
+bot.command('capx', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const parts = (ctx.message.text || '').split(' ').slice(1);
+  if (parts.length < 2) return ctx.reply('Usage: /capx <t.me link | CA> <xCap>');
+  const cap = Number(parts.pop());
+  const key = parts.join(' ');
+  if (!Number.isFinite(cap) || cap <= 0) return ctx.reply('Cap must be a positive number (e.g., 200).');
+
+  const msgId = parseMsgIdFromLink(key);
+  const q = msgId ? { postedMessageId: msgId } : { ca: key.trim() };
+  const docs = await Call.find(q).limit(20);
+  if (!docs.length) return ctx.reply('No matching calls found.');
+
+  let changed = 0;
+  for (const c of docs) {
+    if (!c.entryMc || c.entryMc <= 0) continue;
+    const maxPeak = c.entryMc * cap;
+    const newPeak = Math.min(c.peakMc || c.entryMc, maxPeak);
+    if (newPeak !== c.peakMc) {
+      c.peakMc = newPeak;
+      if (c.lastMc > newPeak) c.lastMc = newPeak;
+      await c.save();
+      changed++;
+    }
+  }
+  await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×.`);
+});
 
 // Text intake (tx sig OR call)
 bot.on('text', async (ctx) => {
@@ -439,7 +515,7 @@ bot.on('text', async (ctx) => {
   // bonding curve (Pump.fun only)
   let curveProgress = null;
   const createdOnName = info.dex || info.dexName || 'DEX';
-  const looksPump = chainUpper === 'SOL' && (/pumpfun/i.test(createdOnName) || /pump$/i.test(raw));
+  const looksPump = chainUpper === 'SOL' && ((/pumpfun/i.test(createdOnName)) || (/pump$/i.test(raw)));
   if (looksPump) {
     try { curveProgress = await fetchPumpfunProgress(caOrMint); } catch {}
   }
