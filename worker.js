@@ -79,6 +79,18 @@ function shortenCa(ca) {
   return `${ca.slice(0, 4)}…${ca.slice(-4)}`;
 }
 
+// ── NEW safety helpers (cap display & persistence) ───────────────────────────
+function cappedNowMc(call, liveMc, nextPeak) {
+  // show "now" as min(live, peakCandidate)
+  const live = Number(liveMc) || 0;
+  const peakCandidate = Number.isFinite(nextPeak) ? nextPeak : (Number(call.peakMc) || 0);
+  return Math.min(live, Math.max(0, peakCandidate));
+}
+function shownX(call, nowMc) {
+  if (!call.entryMc || call.entryMc <= 0) return 1;
+  return Math.max(1, (Number(nowMc) || call.entryMc) / call.entryMc);
+}
+
 // ── Guards / Anti-MEV ────────────────────────────────────────────────────────
 function passQualityGuards(info, callDoc) {
   // Liquidity
@@ -124,7 +136,7 @@ function shouldHoldConfirm(callId, milestone, stillValid, seconds = CONFIRM_SECO
   return true; // keep holding
 }
 
-// ── Alert text ───────────────────────────────────────────────────────────────
+// ── Alert text (uses capped X/MC) ────────────────────────────────────────────
 function rocketAlert({ tkr, ca, xNow, entryMc, nowMc, byUser, hours }) {
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
   const tag = tkr ? `$${tkr}` : shortenCa(ca);
@@ -164,18 +176,25 @@ async function checkOne(c) {
   }
   if (!info || !info.mc) return;
 
-  const nowMc = info.mc;
-  const xNow = nowMc / c.entryMc;
-  const hours = hoursBetween(c.createdAt, NOW());
+  const liveMc = Number(info.mc) || 0;
+  const hours   = hoursBetween(c.createdAt, NOW());
 
-  // Update last/peak (always track)
+  // Determine the peak candidate respecting admin “lock”
+  const prevPeak = Number(c.peakMc) || 0;
+  const nextPeak = c.peakLocked ? prevPeak : Math.max(prevPeak, liveMc);
+
+  // What we show in messages (and store in lastMc) is capped by peak
+  const nowMc  = cappedNowMc(c, liveMc, nextPeak);
+  const xNow   = shownX(c, nowMc);
+
+  // Update last/peak with safety (never re-inflate over admin caps)
   c.lastMc = nowMc;
-  c.peakMc = Math.max(c.peakMc || 0, nowMc);
+  c.peakMc = nextPeak;
 
   // Already fired multipliers
   const already = Array.isArray(c.multipliersHit) ? [...c.multipliersHit] : [];
 
-  // Which thresholds to consider?
+  // Which thresholds to consider based on capped X?
   const lowHits  = collectLowTierHits(xNow, already);
   const highHits = collectHighTierHits(xNow, already);
   const toFire   = [...lowHits, ...highHits].sort((a, b) => a - b);

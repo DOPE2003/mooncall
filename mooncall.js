@@ -419,11 +419,12 @@ bot.command('capx', async (ctx) => {
     if (newPeak !== c.peakMc) {
       c.peakMc = newPeak;
       if (c.lastMc > newPeak) c.lastMc = newPeak;
+      c.peakLocked = true; // 🔒 prevent worker from re-inflating
       await c.save();
       changed++;
     }
   }
-  await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×.`);
+  await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×. (peaks locked)`);
 });
 
 // NEW: Set a user's TOTAL X to a target by trimming biggest calls first
@@ -472,12 +473,24 @@ bot.command('settotalx', async (ctx) => {
     if (newPeak < doc.peakMc - 1e-9) {
       doc.peakMc = newPeak;
       if (doc.lastMc > newPeak) doc.lastMc = newPeak;
+      doc.peakLocked = true; // 🔒 lock after trimming
       await doc.save();
       changed++;
     }
   }
 
-  await ctx.reply(`✅ Set total X for ${who} to ≈ ${current.toFixed(2)}× (updated ${changed} call(s)).`);
+  await ctx.reply(`✅ Set total X for ${who} to ≈ ${current.toFixed(2)}× (updated ${changed} call(s), peaks locked).`);
+});
+
+// OPTIONAL: unlock peaks (if you want the worker to resume updating peaks)
+bot.command('unlockpeak', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Usage: /unlockpeak <t.me link | CA>');
+  const msgId = parseMsgIdFromLink(arg);
+  const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
+  const res = await Call.updateMany(q, { $set: { peakLocked: false } });
+  await ctx.reply(`🔓 Unlocked peaks on ${res.modifiedCount} call(s).`);
 });
 
 // Text intake (tx sig OR call)
@@ -550,17 +563,20 @@ bot.on('text', async (ctx) => {
   const chainUpper = String(info.chain || '').toUpperCase();
   const normCa = normalizeCa(caOrMint, chainUpper);
 
-  // dup check
+  // dup check — show *capped* MC/X using saved peak (respects admin trims)
   const existing = await Call.findOne({ ca: normCa, chain: chainUpper }).sort({ createdAt: -1 });
   if (existing) {
-    const xNow = info.mc && existing.entryMc > 0 ? info.mc / existing.entryMc : null;
+    const live = Number(info.mc) || 0;
+    const peak = Number(existing.peakMc) || live;
+    const nowMcCapped = Math.min(live, peak);
+    const xNow = existing.entryMc > 0 ? nowMcCapped / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
     await ctx.reply(
       `⚠️ <b>Token already called</b> by @${existing.caller?.username || existing.caller?.tgId}.\n\n` +
       `Called MC: ${usd(existing.entryMc)}\n` +
       (xNow
-        ? `Now MC: ${usd(info.mc)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
-        : `Now MC: ${usd(info.mc)}.`),
+        ? `Now MC: ${usd(nowMcCapped)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
+        : `Now MC: ${usd(nowMcCapped)}.`),
       { parse_mode:'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
     );
     return;
@@ -645,6 +661,7 @@ bot.on('text', async (ctx) => {
     entryMc: info.mc || 0,
     peakMc: info.mc || 0,
     lastMc: info.mc || 0,
+    peakLocked: false, // explicit
     multipliersHit: [],
     postedMessageId: messageId || undefined,
     caller: { tgId, username },

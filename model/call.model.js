@@ -8,30 +8,25 @@ const CallerSchema = new mongoose.Schema(
   { _id: false }
 );
 
-// Optional snapshot of stats at the exact time of the call.
-// This lets you show consistent historical numbers (MC/LP/vol, dex name, etc.)
-// even if APIs change later.
 const EntrySnapshotSchema = new mongoose.Schema(
   {
-    mc: { type: Number, min: 0 },          // market cap USD
-    lp: { type: Number, min: 0 },          // liquidity USD
-    vol24h: { type: Number, min: 0 },      // 24h volume USD
+    mc: { type: Number, min: 0 },
+    lp: { type: Number, min: 0 },
+    vol24h: { type: Number, min: 0 },
     priceUsd: { type: Number, min: 0 },
 
-    dex: { type: String },                 // e.g., "raydium" / "pumpfun" / "pancakeswap"
+    dex: { type: String },
     dexName: { type: String },
     chartUrl: { type: String },
     pairUrl: { type: String },
     tradeUrl: { type: String },
 
-    // Pump.fun (SOL) bonding curve % at call time (0..100)
     curveProgress: { type: Number, min: 0, max: 100 },
 
-    // Token safety/metadata flags as known at call time
     liquidityBurnedPct: { type: Number, min: 0, max: 100 },
     freezeAuthority: { type: Boolean },
     mintAuthority: { type: Boolean },
-    dexPaid: { type: Boolean },            // paid “DexS” listing or not
+    dexPaid: { type: Boolean },
     twitter: { type: String },
     imageUrl: { type: String },
   },
@@ -40,10 +35,8 @@ const EntrySnapshotSchema = new mongoose.Schema(
 
 const CallSchema = new mongoose.Schema(
   {
-    // Contract address / mint. (We normalize per-chain in the bot before saving.)
     ca: { type: String, required: true, index: true },
 
-    // Chain enum, always kept uppercase by the setter so 'sol'/'bsc' never break validation.
     chain: {
       type: String,
       enum: ['SOL', 'BSC'],
@@ -54,31 +47,32 @@ const CallSchema = new mongoose.Schema(
 
     ticker: { type: String },
 
-    // Market-cap values (USD). entryMc is when the call was posted.
     entryMc: { type: Number, required: true, min: 0 },
-    peakMc: { type: Number, default: 0, min: 0 },
-    lastMc: { type: Number, default: 0, min: 0 },
+    peakMc:  { type: Number, default: 0, min: 0 },
+    lastMc:  { type: Number, default: 0, min: 0 },
 
-    // Snapshot of data at call time (optional but recommended)
+    // 🔒 prevents worker from re-inflating peak after admin trims
+    peakLocked: { type: Boolean, default: false, index: true },
+
+    // Snapshot of data at call time
     entry: { type: EntrySnapshotSchema, default: undefined },
 
-    // Milestones we already alerted for (e.g., [2,3,10,11,...])
     multipliersHit: { type: [Number], default: [] },
 
-    // Message id of the original channel post (if any)
     postedMessageId: { type: Number },
 
-    // Who called it
     caller: { type: CallerSchema, required: true },
 
-    // ---- Anti-MEV / curation flags (optional) ----
-    // Exclude this call from leaderboard calculations (manual or auto)
-    excludeFromLeaders: { type: Boolean, default: false, index: true },
-    // Lightweight reason(s) or tags like ["mev_spike","illiquid","flash_pump"]
+    // ---- curation flags ----
+    // Use this exact name — all bot code reads/writes it.
+    excludedFromLeaderboard: { type: Boolean, default: false, index: true },
+
+    // Back-compat alias (old field name). Keep so old data isn't lost.
+    // NOTE: alias is for getters/setters on docs; queries/updates should use excludedFromLeaderboard.
+    excludeFromLeaders: { type: Boolean, select: false },
+
     flags: { type: [String], default: [] },
-    // Numeric score from your detector (0..100). Higher = more suspicious.
     suspiciousScore: { type: Number, min: 0, max: 100, default: 0 },
-    // Freeform reason string (easier to show in admin tools)
     suspiciousReason: { type: String },
   },
   { timestamps: true }
