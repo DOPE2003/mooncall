@@ -35,6 +35,9 @@ const MIN_VOL24H_USD   = Number(process.env.MIN_VOL24H_USD || 0);    // fallback
 const MIN_AGE_MIN      = Number(process.env.MIN_AGE_MIN || 0);       // token age (minutes) before alerts
 const CONFIRM_SECONDS  = Number(process.env.CONFIRM_SECONDS || 60);  // must still hold after N seconds
 
+// Coalesce multiple hits (post only the highest × in one message)
+const COALESCE_MILESTONES = String(process.env.COALESCE_MILESTONES || '0') === '1';
+
 // tolerance so we don’t miss by a hair
 const EPS = 0.01;
 
@@ -81,7 +84,6 @@ function shortenCa(ca) {
 
 // ── NEW safety helpers (cap display & persistence) ───────────────────────────
 function cappedNowMc(call, liveMc, nextPeak) {
-  // show "now" as min(live, peakCandidate)
   const live = Number(liveMc) || 0;
   const peakCandidate = Number.isFinite(nextPeak) ? nextPeak : (Number(call.peakMc) || 0);
   return Math.min(live, Math.max(0, peakCandidate));
@@ -93,16 +95,13 @@ function shownX(call, nowMc) {
 
 // ── Guards / Anti-MEV ────────────────────────────────────────────────────────
 function passQualityGuards(info, callDoc) {
-  // Liquidity
   if (MIN_LP_USD > 0 && Number.isFinite(info.lp) && info.lp < MIN_LP_USD) return false;
 
-  // Age (minutes) — prefer info.ageMin if supplied, else compute from call time
   const ageMin = Number.isFinite(info.ageMin)
     ? info.ageMin
     : Math.max(0, (NOW() - callDoc.createdAt) / 60000);
   if (MIN_AGE_MIN > 0 && ageMin < MIN_AGE_MIN) return false;
 
-  // Volume — prefer 5m if present, else 24h if configured
   if (MIN_VOL5M_USD > 0 && Number.isFinite(info.vol5m) && info.vol5m < MIN_VOL5M_USD) return false;
   if (MIN_VOL5M_USD <= 0 && MIN_VOL24H_USD > 0 && Number.isFinite(info.vol24h) && info.vol24h < MIN_VOL24H_USD) return false;
 
@@ -116,24 +115,21 @@ function shouldHoldConfirm(callId, milestone, stillValid, seconds = CONFIRM_SECO
   const rec = pendingConfirms.get(key);
 
   if (!rec) {
-    // first hit — start confirmation window
     pendingConfirms.set(key, { first: now });
     return true; // hold
   }
 
-  // restart window if too old (5× confirm window or at least 5 min)
   const maxWindow = Math.max(5 * 60_000, seconds * 1000 * 5);
   if (now - rec.first > maxWindow) {
     pendingConfirms.set(key, { first: now });
     return true;
   }
 
-  // allow post only when the condition still holds after N seconds
   if ((now - rec.first) >= seconds * 1000 && stillValid) {
     pendingConfirms.delete(key);
-    return false; // do not hold -> post
+    return false; // OK to post
   }
-  return true; // keep holding
+  return true;
 }
 
 // ── Alert text (uses capped X/MC) ────────────────────────────────────────────
@@ -179,7 +175,7 @@ async function checkOne(c) {
   const liveMc = Number(info.mc) || 0;
   const hours   = hoursBetween(c.createdAt, NOW());
 
-  // Determine the peak candidate respecting admin “lock”
+  // Determine the peak candidate respecting admin “lock” (if you use it)
   const prevPeak = Number(c.peakMc) || 0;
   const nextPeak = c.peakLocked ? prevPeak : Math.max(prevPeak, liveMc);
 
@@ -187,7 +183,7 @@ async function checkOne(c) {
   const nowMc  = cappedNowMc(c, liveMc, nextPeak);
   const xNow   = shownX(c, nowMc);
 
-  // Update last/peak with safety (never re-inflate over admin caps)
+  // Update last/peak (never re-inflate over admin caps)
   c.lastMc = nowMc;
   c.peakMc = nextPeak;
 
@@ -197,7 +193,7 @@ async function checkOne(c) {
   // Which thresholds to consider based on capped X?
   const lowHits  = collectLowTierHits(xNow, already);
   const highHits = collectHighTierHits(xNow, already);
-  const toFire   = [...lowHits, ...highHits].sort((a, b) => a - b);
+  let toFire     = [...lowHits, ...highHits].sort((a, b) => a - b);
 
   if (!toFire.length) {
     await c.save();
@@ -211,45 +207,67 @@ async function checkOne(c) {
     return;
   }
 
-  for (const m of toFire) {
-    try {
-      const stillValid = xNow >= m * (1 - EPS);
+  const kb = tradeKeyboards(c.chain || info.chain || 'SOL', info.chartUrl);
 
-      // Two-tick confirmation window (prevents fake spikes)
-      if (shouldHoldConfirm(c._id.toString(), m, stillValid)) continue;
+  // === Coalesced mode: one message at highest ×, atomically claim all hits ===
+  if (COALESCE_MILESTONES && toFire.length > 1) {
+    const highest = toFire[toFire.length - 1];
+    const stillValid = xNow >= highest * (1 - EPS);
+    if (shouldHoldConfirm(c._id.toString(), highest, stillValid)) {
+      await c.save();
+      return;
+    }
 
-      const kb = tradeKeyboards(c.chain || info.chain || 'SOL', info.chartUrl);
+    // Atomic claim: only proceed if 'highest' not already in DB
+    const claim = await Call.updateOne(
+      { _id: c._id, multipliersHit: { $ne: highest } },
+      { $addToSet: { multipliersHit: { $each: toFire } } }
+    );
+    if (claim.modifiedCount === 0) { // someone else posted
+      await c.save();
+      return;
+    }
 
-      if (m >= 10) {
-        const msg = moonAlert({
-          tkr: c.ticker,
-          entryMc: c.entryMc,
-          nowMc,
-          xNow,
-          byUser: c.caller?.username || c.caller?.tgId,
-          hours,
-        });
-        await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb });
-      } else {
-        const msg = rocketAlert({
-          tkr: c.ticker,
-          ca: c.ca,
-          xNow,
-          entryMc: c.entryMc,
-          nowMc,
-          byUser: c.caller?.username || c.caller?.tgId,
-          hours,
-        });
-        await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb });
-      }
+    // Mirror DB change locally so our final save doesn't clobber it
+    for (const m of toFire) if (!already.includes(m)) already.push(m);
 
-      already.push(m);
-      await sleep(200);
-    } catch (e) {
+    const msg = highest >= 10
+      ? moonAlert({ tkr: c.ticker, entryMc: c.entryMc, nowMc, xNow, byUser: c.caller?.username || c.caller?.tgId, hours })
+      : rocketAlert({ tkr: c.ticker, ca: c.ca, xNow, entryMc: c.entryMc, nowMc, byUser: c.caller?.username || c.caller?.tgId, hours });
+
+    try { if (CH_ID) await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb }); } catch (e) {
       console.error('❌ milestone post failed:', e?.response?.description || e.message);
+    }
+
+  } else {
+    // === Normal mode: atomic claim per milestone ===
+    for (const m of toFire) {
+      try {
+        const stillValid = xNow >= m * (1 - EPS);
+        if (shouldHoldConfirm(c._id.toString(), m, stillValid)) continue;
+
+        // Atomic claim — if already present, skip posting
+        const claim = await Call.updateOne(
+          { _id: c._id, multipliersHit: { $ne: m } },
+          { $addToSet: { multipliersHit: m } }
+        );
+        if (claim.modifiedCount === 0) continue; // someone else posted
+
+        already.push(m); // mirror claim locally
+
+        const msg = m >= 10
+          ? moonAlert({ tkr: c.ticker, entryMc: c.entryMc, nowMc, xNow, byUser: c.caller?.username || c.caller?.tgId, hours })
+          : rocketAlert({ tkr: c.ticker, ca: c.ca, xNow, entryMc: c.entryMc, nowMc, byUser: c.caller?.username || c.caller?.tgId, hours });
+
+        if (CH_ID) await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb });
+        await sleep(200);
+      } catch (e) {
+        console.error('❌ milestone post failed:', e?.response?.description || e.message);
+      }
     }
   }
 
+  // Persist non-milestone fields + our local mirror of multipliersHit
   c.multipliersHit = [...new Set(already)].sort((a, b) => a - b);
   await c.save();
 }
