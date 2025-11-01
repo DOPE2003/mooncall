@@ -12,9 +12,14 @@ const { tradeKeyboards } = require('./card');
 const tg = new Telegram(process.env.BOT_TOKEN);
 const CH_ID = Number(process.env.ALERTS_CHANNEL_ID || 0);
 
-// ── Config ───────────────────────────────────────────────────────────────────
-const CHECK_MIN = Number(process.env.CHECK_INTERVAL_MINUTES || 1);   // poll loop
-const BASE_DAYS = Number(process.env.BASE_TRACK_DAYS || 7);          // how long to track calls
+// ── Feature toggles / debug ────────────────────────────────────────────────
+const COALESCE_MILESTONES = String(process.env.COALESCE_MILESTONES || '0') === '1';
+const FORCE_ALERTS        = String(process.env.FORCE_ALERTS || '0') === '1';
+const DEBUG_WORKER        = String(process.env.DEBUG_WORKER || '0') === '1';
+
+// ── Config ─────────────────────────────────────────────────────────────────
+const CHECK_MIN  = Number(process.env.CHECK_INTERVAL_MINUTES || 1);   // poll loop
+const BASE_DAYS  = Number(process.env.BASE_TRACK_DAYS || 7);          // how long to track calls
 
 // Low-tier milestones (<10×)
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
@@ -29,14 +34,11 @@ const HIGH_STEP  = Number(process.env.HIGH_STEP  || 10);   // 10=10x,20x,... | 1
 const HIGH_MAX   = Number(process.env.HIGH_MAX   || 5000);
 
 // Anti-MEV / quality guards (tune in .env)
-const MIN_LP_USD       = Number(process.env.MIN_LP_USD || 2000);     // min liquidity
-const MIN_VOL5M_USD    = Number(process.env.MIN_VOL5M_USD || 500);   // prefer 5-minute volume
-const MIN_VOL24H_USD   = Number(process.env.MIN_VOL24H_USD || 0);    // fallback if no 5m
-const MIN_AGE_MIN      = Number(process.env.MIN_AGE_MIN || 0);       // token age (minutes) before alerts
-const CONFIRM_SECONDS  = Number(process.env.CONFIRM_SECONDS || 60);  // must still hold after N seconds
-
-// Coalesce multiple hits (post only the highest × in one message)
-const COALESCE_MILESTONES = String(process.env.COALESCE_MILESTONES || '0') === '1';
+const MIN_LP_USD     = Number(process.env.MIN_LP_USD || 2000);  // min liquidity
+const MIN_VOL5M_USD  = Number(process.env.MIN_VOL5M_USD || 500);
+const MIN_VOL24H_USD = Number(process.env.MIN_VOL24H_USD || 0); // used only if 5m not provided
+const MIN_AGE_MIN    = Number(process.env.MIN_AGE_MIN || 0);    // token age (minutes) before alerts
+const CONFIRM_SECONDS= Number(process.env.CONFIRM_SECONDS || 60);// must still hold after N seconds
 
 // tolerance so we don’t miss by a hair
 const EPS = 0.01;
@@ -47,7 +49,7 @@ const NOW = () => new Date();
 // For two-tick confirmations (no DB writes). key = `${callId}:${milestone}`
 const pendingConfirms = new Map();
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────
 function hoursBetween(a, b) {
   return Math.max(0, (b - a) / 36e5);
 }
@@ -82,8 +84,9 @@ function shortenCa(ca) {
   return `${ca.slice(0, 4)}…${ca.slice(-4)}`;
 }
 
-// ── NEW safety helpers (cap display & persistence) ───────────────────────────
+// ── Safety helpers (cap display & persistence) ──────────────────────────────
 function cappedNowMc(call, liveMc, nextPeak) {
+  // show "now" as min(live, peakCandidate)
   const live = Number(liveMc) || 0;
   const peakCandidate = Number.isFinite(nextPeak) ? nextPeak : (Number(call.peakMc) || 0);
   return Math.min(live, Math.max(0, peakCandidate));
@@ -93,15 +96,18 @@ function shownX(call, nowMc) {
   return Math.max(1, (Number(nowMc) || call.entryMc) / call.entryMc);
 }
 
-// ── Guards / Anti-MEV ────────────────────────────────────────────────────────
+// ── Guards / Anti-MEV ───────────────────────────────────────────────────────
 function passQualityGuards(info, callDoc) {
+  // Liquidity
   if (MIN_LP_USD > 0 && Number.isFinite(info.lp) && info.lp < MIN_LP_USD) return false;
 
+  // Age (minutes) — prefer info.ageMin if supplied, else compute from call time
   const ageMin = Number.isFinite(info.ageMin)
     ? info.ageMin
     : Math.max(0, (NOW() - callDoc.createdAt) / 60000);
   if (MIN_AGE_MIN > 0 && ageMin < MIN_AGE_MIN) return false;
 
+  // Volume — prefer 5m if present, else 24h if configured
   if (MIN_VOL5M_USD > 0 && Number.isFinite(info.vol5m) && info.vol5m < MIN_VOL5M_USD) return false;
   if (MIN_VOL5M_USD <= 0 && MIN_VOL24H_USD > 0 && Number.isFinite(info.vol24h) && info.vol24h < MIN_VOL24H_USD) return false;
 
@@ -115,24 +121,29 @@ function shouldHoldConfirm(callId, milestone, stillValid, seconds = CONFIRM_SECO
   const rec = pendingConfirms.get(key);
 
   if (!rec) {
+    // first hit — start confirmation window
     pendingConfirms.set(key, { first: now });
+    if (DEBUG_WORKER) console.log('⏳ confirm window start', { callId, milestone, seconds });
     return true; // hold
   }
 
+  // restart window if too old (5× confirm window or at least 5 min)
   const maxWindow = Math.max(5 * 60_000, seconds * 1000 * 5);
   if (now - rec.first > maxWindow) {
     pendingConfirms.set(key, { first: now });
+    if (DEBUG_WORKER) console.log('⏳ confirm window restart', { callId, milestone });
     return true;
   }
 
+  // allow post only when the condition still holds after N seconds
   if ((now - rec.first) >= seconds * 1000 && stillValid) {
     pendingConfirms.delete(key);
-    return false; // OK to post
+    return false; // do not hold -> post
   }
-  return true;
+  return true; // keep holding
 }
 
-// ── Alert text (uses capped X/MC) ────────────────────────────────────────────
+// ── Alert text (uses capped X/MC) ───────────────────────────────────────────
 function rocketAlert({ tkr, ca, xNow, entryMc, nowMc, byUser, hours }) {
   const rockets = '🚀'.repeat(Math.min(12, Math.max(4, Math.round(xNow * 2))));
   const tag = tkr ? `$${tkr}` : shortenCa(ca);
@@ -175,13 +186,13 @@ async function checkOne(c) {
   const liveMc = Number(info.mc) || 0;
   const hours   = hoursBetween(c.createdAt, NOW());
 
-  // Determine the peak candidate respecting admin “lock” (if you use it)
+  // Determine the peak candidate respecting a potential admin “lock”
   const prevPeak = Number(c.peakMc) || 0;
   const nextPeak = c.peakLocked ? prevPeak : Math.max(prevPeak, liveMc);
 
   // What we show in messages (and store in lastMc) is capped by peak
-  const nowMc  = cappedNowMc(c, liveMc, nextPeak);
-  const xNow   = shownX(c, nowMc);
+  const nowMc = cappedNowMc(c, liveMc, nextPeak);
+  const xNow  = shownX(c, nowMc);
 
   // Update last/peak (never re-inflate over admin caps)
   c.lastMc = nowMc;
@@ -200,9 +211,21 @@ async function checkOne(c) {
     return;
   }
 
-  // Quality / anti-MEV guards (HARD guard: if it fails, skip alerts)
+  // Quality / anti-MEV guards (HARD guard: if it fails, skip alerts unless FORCE_ALERTS)
   const qualityOK = passQualityGuards(info, c);
-  if (!qualityOK) {
+  if (!qualityOK && !FORCE_ALERTS) {
+    if (DEBUG_WORKER) {
+      const ageMin = Number.isFinite(info.ageMin)
+        ? info.ageMin
+        : Math.max(0, (Date.now() - c.createdAt) / 60000);
+      console.log('⏭️  Skip alert (guards)', {
+        ca: c.ca,
+        lp: info.lp,
+        vol5m: info.vol5m,
+        vol24h: info.vol24h,
+        ageMin
+      });
+    }
     await c.save();
     return;
   }
@@ -213,7 +236,7 @@ async function checkOne(c) {
   if (COALESCE_MILESTONES && toFire.length > 1) {
     const highest = toFire[toFire.length - 1];
     const stillValid = xNow >= highest * (1 - EPS);
-    if (shouldHoldConfirm(c._id.toString(), highest, stillValid)) {
+    if (shouldHoldConfirm(c._id.toString(), highest, stillValid, CONFIRM_SECONDS)) {
       await c.save();
       return;
     }
@@ -223,7 +246,8 @@ async function checkOne(c) {
       { _id: c._id, multipliersHit: { $ne: highest } },
       { $addToSet: { multipliersHit: { $each: toFire } } }
     );
-    if (claim.modifiedCount === 0) { // someone else posted
+    if (claim.modifiedCount === 0) {
+      if (DEBUG_WORKER) console.log('🔁 coalesced: already claimed by another tick', { ca: c.ca, highest });
       await c.save();
       return;
     }
@@ -235,7 +259,10 @@ async function checkOne(c) {
       ? moonAlert({ tkr: c.ticker, entryMc: c.entryMc, nowMc, xNow, byUser: c.caller?.username || c.caller?.tgId, hours })
       : rocketAlert({ tkr: c.ticker, ca: c.ca, xNow, entryMc: c.entryMc, nowMc, byUser: c.caller?.username || c.caller?.tgId, hours });
 
-    try { if (CH_ID) await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb }); } catch (e) {
+    try {
+      if (CH_ID) await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb });
+      if (DEBUG_WORKER) console.log('✅ posted (coalesced)', { ca: c.ca, highest, xNow: xNow.toFixed(2) });
+    } catch (e) {
       console.error('❌ milestone post failed:', e?.response?.description || e.message);
     }
 
@@ -244,14 +271,17 @@ async function checkOne(c) {
     for (const m of toFire) {
       try {
         const stillValid = xNow >= m * (1 - EPS);
-        if (shouldHoldConfirm(c._id.toString(), m, stillValid)) continue;
+        if (shouldHoldConfirm(c._id.toString(), m, stillValid, CONFIRM_SECONDS)) continue;
 
         // Atomic claim — if already present, skip posting
         const claim = await Call.updateOne(
           { _id: c._id, multipliersHit: { $ne: m } },
           { $addToSet: { multipliersHit: m } }
         );
-        if (claim.modifiedCount === 0) continue; // someone else posted
+        if (claim.modifiedCount === 0) {
+          if (DEBUG_WORKER) console.log('🔁 milestone already claimed by another tick', { ca: c.ca, m });
+          continue;
+        }
 
         already.push(m); // mirror claim locally
 
@@ -260,6 +290,7 @@ async function checkOne(c) {
           : rocketAlert({ tkr: c.ticker, ca: c.ca, xNow, entryMc: c.entryMc, nowMc, byUser: c.caller?.username || c.caller?.tgId, hours });
 
         if (CH_ID) await tg.sendMessage(CH_ID, msg, { parse_mode: 'HTML', ...kb });
+        if (DEBUG_WORKER) console.log('✅ posted', { ca: c.ca, m, xNow: xNow.toFixed(2) });
         await sleep(200);
       } catch (e) {
         console.error('❌ milestone post failed:', e?.response?.description || e.message);
@@ -272,7 +303,7 @@ async function checkOne(c) {
   await c.save();
 }
 
-// ── Runner ───────────────────────────────────────────────────────────────────
+// ── Runner ──────────────────────────────────────────────────────────────────
 async function runOnce() {
   const since = new Date(Date.now() - BASE_DAYS * 24 * 3600 * 1000);
   const calls = await Call.find({
@@ -283,7 +314,7 @@ async function runOnce() {
   }).sort({ createdAt: -1 }).limit(1000);
 
   if (!calls.length) return;
-  console.log(`🔎 Checking ${calls.length} calls…`);
+  if (DEBUG_WORKER) console.log(`🔎 Checking ${calls.length} calls…`);
 
   for (const c of calls) {
     try { await checkOne(c); } catch (e) { console.error('checkOne error:', e.message); }
