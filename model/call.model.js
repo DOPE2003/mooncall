@@ -21,8 +21,10 @@ const EntrySnapshotSchema = new mongoose.Schema(
     pairUrl: { type: String },
     tradeUrl: { type: String },
 
+    // Pump.fun curve progress (0..100)
     curveProgress: { type: Number, min: 0, max: 100 },
 
+    // Safety/metadata at call time
     liquidityBurnedPct: { type: Number, min: 0, max: 100 },
     freezeAuthority: { type: Boolean },
     mintAuthority: { type: Boolean },
@@ -35,8 +37,10 @@ const EntrySnapshotSchema = new mongoose.Schema(
 
 const CallSchema = new mongoose.Schema(
   {
+    // Contract address / mint
     ca: { type: String, required: true, index: true },
 
+    // Chain enum (uppercased by setter)
     chain: {
       type: String,
       enum: ['SOL', 'BSC'],
@@ -47,30 +51,35 @@ const CallSchema = new mongoose.Schema(
 
     ticker: { type: String },
 
+    // MC tracking
     entryMc: { type: Number, required: true, min: 0 },
     peakMc:  { type: Number, default: 0, min: 0 },
     lastMc:  { type: Number, default: 0, min: 0 },
 
-    // 🔒 prevents worker from re-inflating peak after admin trims
+    // 🔒 prevent worker from re-inflating after admin trims
     peakLocked: { type: Boolean, default: false, index: true },
 
     // Snapshot of data at call time
     entry: { type: EntrySnapshotSchema, default: undefined },
 
+    // Milestones hit (e.g. [2,3,10])
     multipliersHit: { type: [Number], default: [] },
 
-    postedMessageId: { type: Number },
+    // Channel message id for original post
+    postedMessageId: { type: Number, index: true },
 
+    // Who called it
     caller: { type: CallerSchema, required: true },
 
     // ---- curation flags ----
-    // Use this exact name — all bot code reads/writes it.
+    // Canonical flag used everywhere now
     excludedFromLeaderboard: { type: Boolean, default: false, index: true },
 
-    // Back-compat alias (old field name). Keep so old data isn't lost.
-    // NOTE: alias is for getters/setters on docs; queries/updates should use excludedFromLeaderboard.
+    // Legacy flag kept for back-compat (hidden by default)
+    // NOTE: queries should use excludedFromLeaderboard; we still OR this in pipelines.
     excludeFromLeaders: { type: Boolean, select: false },
 
+    // Optional tagging
     flags: { type: [String], default: [] },
     suspiciousScore: { type: Number, min: 0, max: 100, default: 0 },
     suspiciousReason: { type: String },
@@ -78,7 +87,8 @@ const CallSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Helpful compound index for lookups & dedupe checks
-CallSchema.index({ ca: 1, chain: 1, createdAt: -1 });
+// Helpful indexes
+CallSchema.index({ ca: 1, chain: 1, createdAt: -1 });  // fast dedupe/recent lookups
+CallSchema.index({ 'caller.tgId': 1, createdAt: -1 }); // /mycalls & leaderboards
 
 module.exports = mongoose.model('Call', CallSchema);

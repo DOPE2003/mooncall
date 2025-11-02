@@ -160,9 +160,17 @@ async function getUserTotalsForCards(tgId) {
     'caller.tgId': String(tgId),
     entryMc: { $gt: 0 },
     peakMc: { $gt: 0 },
-    $or: [
-      { excludedFromLeaderboard: { $exists: false } },
-      { excludedFromLeaderboard: { $ne: true } }
+    $and: [
+      { $or: [
+          { excludedFromLeaderboard: { $exists: false } },
+          { excludedFromLeaderboard: { $ne: true } }
+        ]
+      },
+      { $or: [
+          { excludeFromLeaders: { $exists: false } },
+          { excludeFromLeaders: { $ne: true } }
+        ]
+      },
     ],
   }).lean();
 
@@ -318,12 +326,25 @@ bot.action('premium:txsig', async (ctx) => {
 function leaderboardPipeline({ hideAdmins = false } = {}) {
   const matchStages = [
     { entryMc: { $gt: 0 } },
-    { peakMc: { $gt: 0 } },
-    { $or: [{ excludedFromLeaderboard: { $exists: false } }, { excludedFromLeaderboard: { $ne: true } }] },
+    { peakMc:  { $gt: 0 } },
+
+    // Respect BOTH exclusion flags
+    { $or: [
+        { excludedFromLeaderboard: { $exists: false } },
+        { excludedFromLeaderboard: { $ne: true } }
+      ]
+    },
+    { $or: [
+        { excludeFromLeaders: { $exists: false } },
+        { excludeFromLeaders: { $ne: true } }
+      ]
+    },
   ];
+
   if (hideAdmins && ADMIN_IDS.length) {
     matchStages.push({ 'caller.tgId': { $nin: ADMIN_IDS.map(String) } });
   }
+
   return [
     { $match: { $and: matchStages } },
     { $project: { user: '$caller.username', tgId: '$caller.tgId', x: { $divide: ['$peakMc', '$entryMc'] } } },
@@ -383,7 +404,7 @@ bot.command('exclude', async (ctx) => {
   if (!arg) return ctx.reply('Usage: /exclude <t.me link | CA>');
   const msgId = parseMsgIdFromLink(arg);
   const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
-  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: true } });
+  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: true, excludeFromLeaders: true } });
   await ctx.reply(`✅ Excluded ${res.modifiedCount} call(s) from leaderboard.`);
 });
 
@@ -393,7 +414,7 @@ bot.command('include', async (ctx) => {
   if (!arg) return ctx.reply('Usage: /include <t.me link | CA>');
   const msgId = parseMsgIdFromLink(arg);
   const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
-  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: false } });
+  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: false, excludeFromLeaders: false } });
   await ctx.reply(`✅ Included ${res.modifiedCount} call(s) back in leaderboard.`);
 });
 
@@ -491,6 +512,52 @@ bot.command('unlockpeak', async (ctx) => {
   const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
   const res = await Call.updateMany(q, { $set: { peakLocked: false } });
   await ctx.reply(`🔓 Unlocked peaks on ${res.modifiedCount} call(s).`);
+});
+
+// ===== Admin-only leaderboard maintenance =====
+bot.command('lb_reset', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const res = await Call.updateMany(
+    {},
+    {
+      $set: {
+        excludedFromLeaderboard: true,
+        excludeFromLeaders: true
+      },
+      $addToSet: { flags: 'season_reset' }
+    }
+  );
+  await ctx.reply(`✅ Leaderboard reset.\nExcluded ${res.modifiedCount} call(s) from leaderboard.`);
+});
+
+bot.command('lb_restore', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const res = await Call.updateMany(
+    {},
+    {
+      $set: {
+        excludedFromLeaderboard: false,
+        excludeFromLeaders: false
+      }
+    }
+  );
+  await ctx.reply(`✅ Leaderboard restored.\nRe-included ${res.modifiedCount} call(s) to leaderboard.`);
+});
+
+bot.command('lb_status', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const total = await Call.countDocuments({});
+  const excluded = await Call.countDocuments({
+    $or: [
+      { excludedFromLeaderboard: true },
+      { excludeFromLeaders: true }
+    ]
+  });
+  const included = total - excluded;
+
+  await ctx.reply(
+    `📊 Leaderboard status\nTotal calls: ${total}\nIncluded: ${included}\nExcluded: ${excluded}`
+  );
 });
 
 // Text intake (tx sig OR call)
