@@ -22,6 +22,10 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .map((x) => x.trim())
   .filter(Boolean);
 
+// runtime-toggleable flag (can be changed via /lbhideadmins)
+let LEADERBOARD_HIDE_ADMINS = String(process.env.LEADERBOARD_HIDE_ADMINS || '')
+  .toLowerCase() === 'true';
+
 const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
 const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
@@ -29,9 +33,6 @@ const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() =
 const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim();
 const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
 const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();
-
-const LEADERBOARD_HIDE_ADMINS = String(process.env.LEADERBOARD_HIDE_ADMINS || '')
-  .toLowerCase() === 'true';
 
 // for duplicate summary only
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
@@ -47,6 +48,16 @@ const SOON = '🚧 Available soon.';
 const awaitingCA = new Set();
 const awaitingTxSig = new Set();
 
+// --- tiny in-memory cache for /leaders --------------------------------------
+const LB_TTL_MS = 60_000; // 1 min
+let LB_CACHE = { rows: null, ts: 0, hideAdmins: LEADERBOARD_HIDE_ADMINS };
+
+async function rebuildLeaderboardCache(hideAdmins) {
+  const rows = await Call.aggregate(leaderboardPipeline({ hideAdmins })).exec();
+  LB_CACHE = { rows, ts: Date.now(), hideAdmins };
+  return rows;
+}
+
 // --- helpers -----------------------------------------------------------------
 const cIdForPrivate = (id) => String(id).replace('-100', ''); // t.me/c/<id>/<msg>
 function viewChannelButton(messageId) {
@@ -59,6 +70,7 @@ const highestMilestone = (x) => { let best = null; for (const m of MILESTONES) i
 const normalizeCa = (ca, chainUpper) => (chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca);
 
 function isAdminUser(ctx) { return ADMIN_IDS.includes(String(ctx.from.id)); }
+function fmtUser(u, id) { return (u && u !== 'undefined') ? `@${u}` : id; }
 function parseMsgIdFromLink(s='') { const m = String(s).match(/t\.me\/c\/\d+\/(\d+)/i); return m ? Number(m[1]) : null; }
 
 // extract BSC/SOL address (SOL may end with “…pump”)
@@ -160,17 +172,9 @@ async function getUserTotalsForCards(tgId) {
     'caller.tgId': String(tgId),
     entryMc: { $gt: 0 },
     peakMc: { $gt: 0 },
-    $and: [
-      { $or: [
-          { excludedFromLeaderboard: { $exists: false } },
-          { excludedFromLeaderboard: { $ne: true } }
-        ]
-      },
-      { $or: [
-          { excludeFromLeaders: { $exists: false } },
-          { excludeFromLeaders: { $ne: true } }
-        ]
-      },
+    $or: [
+      { excludedFromLeaderboard: { $exists: false } },
+      { excludedFromLeaderboard: { $ne: true } }
     ],
   }).lean();
 
@@ -326,25 +330,12 @@ bot.action('premium:txsig', async (ctx) => {
 function leaderboardPipeline({ hideAdmins = false } = {}) {
   const matchStages = [
     { entryMc: { $gt: 0 } },
-    { peakMc:  { $gt: 0 } },
-
-    // Respect BOTH exclusion flags
-    { $or: [
-        { excludedFromLeaderboard: { $exists: false } },
-        { excludedFromLeaderboard: { $ne: true } }
-      ]
-    },
-    { $or: [
-        { excludeFromLeaders: { $exists: false } },
-        { excludeFromLeaders: { $ne: true } }
-      ]
-    },
+    { peakMc: { $gt: 0 } },
+    { $or: [{ excludedFromLeaderboard: { $exists: false } }, { excludedFromLeaderboard: { $ne: true } }] },
   ];
-
   if (hideAdmins && ADMIN_IDS.length) {
     matchStages.push({ 'caller.tgId': { $nin: ADMIN_IDS.map(String) } });
   }
-
   return [
     { $match: { $and: matchStages } },
     { $project: { user: '$caller.username', tgId: '$caller.tgId', x: { $divide: ['$peakMc', '$entryMc'] } } },
@@ -352,6 +343,14 @@ function leaderboardPipeline({ hideAdmins = false } = {}) {
     { $sort: { sumX: -1 } },
     { $limit: 10 },
   ];
+}
+
+async function getLeaderboard(hideAdmins) {
+  // use cache if not stale & same admin-visibility
+  if (LB_CACHE.rows && Date.now() - LB_CACHE.ts < LB_TTL_MS && LB_CACHE.hideAdmins === hideAdmins) {
+    return LB_CACHE.rows;
+  }
+  return rebuildLeaderboardCache(hideAdmins);
 }
 
 // Leaderboard (button + /leaders)
@@ -363,12 +362,14 @@ function leadersHandler(forceAll) {
   return async (ctx) => {
     try {
       if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
-      const rows = await Call.aggregate(
-        leaderboardPipeline({ hideAdmins: forceAll ? false : LEADERBOARD_HIDE_ADMINS })
-      );
+      const hideAdmins = forceAll ? false : LEADERBOARD_HIDE_ADMINS;
+      const rows = await getLeaderboard(hideAdmins);
       if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
+
       const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-      const lines = rows.map((r, i) => `${medal(i)} @${r._id.user || r._id.tgId} — ${r.sumX.toFixed(2)}× total`);
+      const lines = rows.map((r, i) =>
+        `${medal(i)} ${fmtUser(r._id.user, r._id.tgId)} — ${r.sumX.toFixed(2)}× total`
+      );
       await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
     } catch (e) {
       console.error(e);
@@ -376,6 +377,30 @@ function leadersHandler(forceAll) {
     }
   };
 }
+
+// Admin: force refresh leaderboard cache
+bot.command('lbrefresh', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  try {
+    const rows = await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS);
+    await ctx.reply(`♻️ Leaderboard rebuilt (${rows.length} rows).`);
+  } catch (e) {
+    console.error(e);
+    await ctx.reply('Failed to rebuild leaderboard.');
+  }
+});
+
+// Admin: toggle hide-admins at runtime (persists in memory until restart)
+bot.command('lbhideadmins', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const arg = (ctx.message.text || '').split(/\s+/)[1]?.toLowerCase();
+  if (!arg || !['on','off'].includes(arg)) {
+    return ctx.reply('Usage: /lbhideadmins on|off');
+  }
+  LEADERBOARD_HIDE_ADMINS = (arg === 'on');
+  LB_CACHE = { rows: null, ts: 0, hideAdmins: LEADERBOARD_HIDE_ADMINS }; // drop cache
+  await ctx.reply(`✅ Hide-admins on /leaders: ${LEADERBOARD_HIDE_ADMINS ? 'ON' : 'OFF'}`);
+});
 
 // My calls (button + /mycalls)
 bot.action('cmd:mycalls', myCallsHandler);
@@ -404,7 +429,7 @@ bot.command('exclude', async (ctx) => {
   if (!arg) return ctx.reply('Usage: /exclude <t.me link | CA>');
   const msgId = parseMsgIdFromLink(arg);
   const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
-  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: true, excludeFromLeaders: true } });
+  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: true } });
   await ctx.reply(`✅ Excluded ${res.modifiedCount} call(s) from leaderboard.`);
 });
 
@@ -414,7 +439,7 @@ bot.command('include', async (ctx) => {
   if (!arg) return ctx.reply('Usage: /include <t.me link | CA>');
   const msgId = parseMsgIdFromLink(arg);
   const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
-  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: false, excludeFromLeaders: false } });
+  const res = await Call.updateMany(q, { $set: { excludedFromLeaderboard: false } });
   await ctx.reply(`✅ Included ${res.modifiedCount} call(s) back in leaderboard.`);
 });
 
@@ -476,7 +501,7 @@ bot.command('settotalx', async (ctx) => {
   // Reduce biggest contributions first; don't push any call below 1×
   for (const r of rows) {
     if (current <= target) break;
-    const maxReduce = Math.max(0, r.x - 1);       // cannot go below 1×
+    const maxReduce = Math.max(0, r.x - 1);
     const need = current - target;
     const delta = Math.min(maxReduce, need);
     if (delta <= 0) continue;
@@ -512,52 +537,6 @@ bot.command('unlockpeak', async (ctx) => {
   const q = msgId ? { postedMessageId: msgId } : { ca: arg.trim() };
   const res = await Call.updateMany(q, { $set: { peakLocked: false } });
   await ctx.reply(`🔓 Unlocked peaks on ${res.modifiedCount} call(s).`);
-});
-
-// ===== Admin-only leaderboard maintenance =====
-bot.command('lb_reset', async (ctx) => {
-  if (!isAdminUser(ctx)) return;
-  const res = await Call.updateMany(
-    {},
-    {
-      $set: {
-        excludedFromLeaderboard: true,
-        excludeFromLeaders: true
-      },
-      $addToSet: { flags: 'season_reset' }
-    }
-  );
-  await ctx.reply(`✅ Leaderboard reset.\nExcluded ${res.modifiedCount} call(s) from leaderboard.`);
-});
-
-bot.command('lb_restore', async (ctx) => {
-  if (!isAdminUser(ctx)) return;
-  const res = await Call.updateMany(
-    {},
-    {
-      $set: {
-        excludedFromLeaderboard: false,
-        excludeFromLeaders: false
-      }
-    }
-  );
-  await ctx.reply(`✅ Leaderboard restored.\nRe-included ${res.modifiedCount} call(s) to leaderboard.`);
-});
-
-bot.command('lb_status', async (ctx) => {
-  if (!isAdminUser(ctx)) return;
-  const total = await Call.countDocuments({});
-  const excluded = await Call.countDocuments({
-    $or: [
-      { excludedFromLeaderboard: true },
-      { excludeFromLeaders: true }
-    ]
-  });
-  const included = total - excluded;
-
-  await ctx.reply(
-    `📊 Leaderboard status\nTotal calls: ${total}\nIncluded: ${included}\nExcluded: ${excluded}`
-  );
 });
 
 // Text intake (tx sig OR call)
@@ -639,7 +618,7 @@ bot.on('text', async (ctx) => {
     const xNow = existing.entryMc > 0 ? nowMcCapped / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
     await ctx.reply(
-      `⚠️ <b>Token already called</b> by @${existing.caller?.username || existing.caller?.tgId}.\n\n` +
+      `⚠️ <b>Token already called</b> by ${fmtUser(existing.caller?.username, existing.caller?.tgId)}.\n\n` +
       `Called MC: ${usd(existing.entryMc)}\n` +
       (xNow
         ? `Now MC: ${usd(nowMcCapped)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
@@ -665,8 +644,8 @@ bot.on('text', async (ctx) => {
   const createdOnName = info.dex || info.dexName || 'DEX';
   const looksPump = chainUpper === 'SOL' && (
     /\bpump(fun|swap)?\b/i.test(String(createdOnName || '')) ||
-    /\bpump$/i.test(String(raw || '')) ||
-    /\bpump$/i.test(String(caOrMint || ''))
+    /\bpump$/i.test(String(caOrMint || '')) ||
+    /\bpump$/i.test(String(raw || ''))
   );
   if (looksPump) {
     try { curveProgress = await fetchPumpfunProgress(caOrMint); } catch {}
@@ -741,6 +720,9 @@ bot.on('text', async (ctx) => {
       'We’ll track it & alert milestones.',
     { parse_mode: 'HTML', ...viewChannelButton(messageId) }
   );
+
+  // touch leaderboard cache (best-effort)
+  try { await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS); } catch {}
 });
 
 // errors & launch
