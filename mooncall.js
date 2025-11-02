@@ -2,11 +2,41 @@
 require('dotenv').config();
 require('./lib/db');
 
+const mongoose = require('mongoose');
 const { Telegraf, Markup } = require('telegraf');
 const Call = require('./model/call.model');
 const PremiumUser = require('./model/premium.model');
 const { getTokenInfo, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
+
+// --- minimal KV settings model (in this file) -------------------------------
+const AppSetting =
+  mongoose.models.AppSetting ||
+  mongoose.model(
+    'AppSetting',
+    new mongoose.Schema(
+      { _id: String, value: mongoose.Schema.Types.Mixed },
+      { timestamps: true, collection: 'app_settings' }
+    )
+  );
+
+// helpers to persist season start
+async function getSeasonStart() {
+  const doc = await AppSetting.findById('leaderboardSeasonStart').lean();
+  if (!doc?.value) return null;
+  const d = new Date(doc.value);
+  return Number.isFinite(d.valueOf()) ? d : null;
+}
+async function setSeasonStart(d) {
+  await AppSetting.findByIdAndUpdate(
+    'leaderboardSeasonStart',
+    { value: d.toISOString() },
+    { upsert: true }
+  );
+}
+async function clearSeasonStart() {
+  await AppSetting.findByIdAndDelete('leaderboardSeasonStart');
+}
 
 // --- fetch polyfill (Node < 18) ---------------------------------------------
 const doFetch =
@@ -23,12 +53,13 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .filter(Boolean);
 
 // runtime-toggleable flag (can be changed via /lbhideadmins)
-let LEADERBOARD_HIDE_ADMINS = String(process.env.LEADERBOARD_HIDE_ADMINS || '')
-  .toLowerCase() === 'true';
+let LEADERBOARD_HIDE_ADMINS =
+  String(process.env.LEADERBOARD_HIDE_ADMINS || '').toLowerCase() === 'true';
 
 const CHANNEL_LINK = process.env.COMMUNITY_CHANNEL_URL || 'https://t.me';
 const BOT_USERNAME = process.env.BOT_USERNAME || 'your_bot';
-const WANT_IMAGE = String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
+const WANT_IMAGE =
+  String(process.env.CALL_CARD_USE_IMAGE || '').toLowerCase() === 'true';
 
 const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim();
 const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
@@ -48,14 +79,41 @@ const SOON = '🚧 Available soon.';
 const awaitingCA = new Set();
 const awaitingTxSig = new Set();
 
-// --- tiny in-memory cache for /leaders --------------------------------------
-const LB_TTL_MS = 60_000; // 1 min
-let LB_CACHE = { rows: null, ts: 0, hideAdmins: LEADERBOARD_HIDE_ADMINS };
+// --- leaderboard cache (season-aware) ---------------------------------------
+const LB_TTL_MS = 60_000; // 1 minute
+let LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
+
+function fmtDate(d) {
+  return new Date(d).toISOString().slice(0, 10);
+}
 
 async function rebuildLeaderboardCache(hideAdmins) {
-  const rows = await Call.aggregate(leaderboardPipeline({ hideAdmins })).exec();
-  LB_CACHE = { rows, ts: Date.now(), hideAdmins };
+  const seasonStart = await getSeasonStart();
+  const rows = await Call.aggregate(
+    leaderboardPipeline({ hideAdmins, seasonStart })
+  ).exec();
+  LB_CACHE = {
+    rows,
+    ts: Date.now(),
+    hideAdmins,
+    seasonKey: seasonStart ? fmtDate(seasonStart) : 'all',
+  };
   return rows;
+}
+
+async function getLeaderboard(hideAdmins) {
+  const seasonStart = await getSeasonStart();
+  const seasonKey = seasonStart ? fmtDate(seasonStart) : 'all';
+
+  if (
+    LB_CACHE.rows &&
+    Date.now() - LB_CACHE.ts < LB_TTL_MS &&
+    LB_CACHE.hideAdmins === hideAdmins &&
+    LB_CACHE.seasonKey === seasonKey
+  ) {
+    return LB_CACHE.rows;
+  }
+  return rebuildLeaderboardCache(hideAdmins);
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -66,12 +124,24 @@ function viewChannelButton(messageId) {
   const url = `https://t.me/c/${shortId}/${messageId}`;
   return Markup.inlineKeyboard([[Markup.button.url('📣 View Channel', url)]]);
 }
-const highestMilestone = (x) => { let best = null; for (const m of MILESTONES) if (x >= m) best = m; return best; };
-const normalizeCa = (ca, chainUpper) => (chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca);
+const highestMilestone = (x) => {
+  let best = null;
+  for (const m of MILESTONES) if (x >= m) best = m;
+  return best;
+};
+const normalizeCa = (ca, chainUpper) =>
+  chainUpper === 'BSC' ? String(ca || '').toLowerCase() : ca;
 
-function isAdminUser(ctx) { return ADMIN_IDS.includes(String(ctx.from.id)); }
-function fmtUser(u, id) { return (u && u !== 'undefined') ? `@${u}` : id; }
-function parseMsgIdFromLink(s='') { const m = String(s).match(/t\.me\/c\/\d+\/(\d+)/i); return m ? Number(m[1]) : null; }
+function isAdminUser(ctx) {
+  return ADMIN_IDS.includes(String(ctx.from.id));
+}
+function fmtUser(u, id) {
+  return u && u !== 'undefined' ? `@${u}` : id;
+}
+function parseMsgIdFromLink(s = '') {
+  const m = String(s).match(/t\.me\/c\/\d+\/(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
 
 // extract BSC/SOL address (SOL may end with “…pump”)
 function extractAddress(input) {
@@ -84,7 +154,9 @@ function extractAddress(input) {
 }
 
 // plausible Solana tx sig?
-function looksLikeSig(s) { return /^[1-9A-HJ-NP-Za-km-z]{43,88}$/.test(String(s).trim()); }
+function looksLikeSig(s) {
+  return /^[1-9A-HJ-NP-Za-km-z]{43,88}$/.test(String(s).trim());
+}
 
 // limits
 async function getDailyLimit(tgId) {
@@ -95,7 +167,10 @@ async function getDailyLimit(tgId) {
 }
 async function callsInLast24h(tgId) {
   const since = new Date(Date.now() - 24 * 3600 * 1000);
-  return Call.countDocuments({ 'caller.tgId': String(tgId), createdAt: { $gte: since } });
+  return Call.countDocuments({
+    'caller.tgId': String(tgId),
+    createdAt: { $gte: since },
+  });
 }
 
 // Telegram-safe Phantom link (URLs only; Telegram blocks custom schemes)
@@ -117,7 +192,9 @@ async function fetchPumpfunProgress(mint) {
     const clean = String(mint || '').replace(/pump$/i, '');
 
     // JSON endpoint
-    let r = await doFetch(`https://pump.fun/api/data/${clean}`, { headers: { accept: 'application/json' } });
+    let r = await doFetch(`https://pump.fun/api/data/${clean}`, {
+      headers: { accept: 'application/json' },
+    });
     if (r.ok) {
       const j = await r.json();
       let pct =
@@ -134,11 +211,14 @@ async function fetchPumpfunProgress(mint) {
       }
     }
     // HTML fallback
-    r = await doFetch(`https://pump.fun/coin/${clean}`, { headers: { accept: 'text/html' } });
+    r = await doFetch(`https://pump.fun/coin/${clean}`, {
+      headers: { accept: 'text/html' },
+    });
     if (!r.ok) return null;
     const html = await r.text();
-    const m = html.match(/"bonding(?:_curve_|Curve)progress"\s*:\s*([0-9.]+)/i)
-           || html.match(/"bondingCurveProgress"\s*:\s*([0-9.]+)/);
+    const m =
+      html.match(/"bonding(?:_curve_|Curve)progress"\s*:\s*([0-9.]+)/i) ||
+      html.match(/"bondingCurveProgress"\s*:\s*([0-9.]+)/);
     if (m && m[1]) {
       let pct = Number(m[1]);
       if (pct <= 1) pct *= 100;
@@ -154,13 +234,18 @@ async function fetchPumpfunProgress(mint) {
 function makeBubblemapUrl(chainUpper, ca) {
   if (!ca?.startsWith?.('0x')) return null;
   const map = {
-    ETH: 'eth', ETHEREUM: 'eth',
+    ETH: 'eth',
+    ETHEREUM: 'eth',
     BSC: 'bsc',
-    ARBITRUM: 'arbitrum', ARB: 'arbitrum',
+    ARBITRUM: 'arbitrum',
+    ARB: 'arbitrum',
     BASE: 'base',
-    OPTIMISM: 'optimism', OP: 'optimism',
-    POLYGON: 'polygon', MATIC: 'polygon',
-    AVALANCHE: 'avalanche', AVAX: 'avalanche',
+    OPTIMISM: 'optimism',
+    OP: 'optimism',
+    POLYGON: 'polygon',
+    MATIC: 'polygon',
+    AVALANCHE: 'avalanche',
+    AVAX: 'avalanche',
   };
   const key = map[chainUpper];
   return key ? `https://app.bubblemaps.io/token/${key}/${ca}` : null;
@@ -174,12 +259,12 @@ async function getUserTotalsForCards(tgId) {
     peakMc: { $gt: 0 },
     $or: [
       { excludedFromLeaderboard: { $exists: false } },
-      { excludedFromLeaderboard: { $ne: true } }
+      { excludedFromLeaderboard: { $ne: true } },
     ],
   }).lean();
 
   const totalCalls = calls.length;
-  const totalX = calls.reduce((sum, c) => sum + (c.peakMc / c.entryMc), 0);
+  const totalX = calls.reduce((sum, c) => sum + c.peakMc / c.entryMc, 0);
   const avgX = totalCalls ? totalX / totalCalls : 0;
   return { totalCalls, totalX, avgX };
 }
@@ -192,17 +277,20 @@ bot.start(async (ctx) => {
       '» Each user can make 1 call per day\n' +
       '» Calls are tracked by PnL performance\n' +
       '» The top performer gets rewards + bragging rights',
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-      [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
-      [Markup.button.callback('👥 Community Calls', 'cmd:community')],
-      [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
-      [Markup.button.callback('🧾 Make a call', 'cmd:make')],
-      [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
-      [Markup.button.callback('📜 Rules', 'cmd:rules')],
-      [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
-      [Markup.button.callback('🚀 Boost', 'cmd:boost')],
-      [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
-    ]) }
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('⚡ Telegram Channel', CHANNEL_LINK)],
+        [Markup.button.callback('👥 Community Calls', 'cmd:community')],
+        [Markup.button.callback('🏅 Top Callers', 'cmd:leaders')],
+        [Markup.button.callback('🧾 Make a call', 'cmd:make')],
+        [Markup.button.callback('📒 My calls', 'cmd:mycalls')],
+        [Markup.button.callback('📜 Rules', 'cmd:rules')],
+        [Markup.button.callback('⭐ Subscribe', 'cmd:subscribe')],
+        [Markup.button.callback('🚀 Boost', 'cmd:boost')],
+        [Markup.button.callback('⚡ Boosted Coins', 'cmd:boosted')],
+      ]),
+    }
   );
 
   const botLink = `https://t.me/${BOT_USERNAME}`;
@@ -213,19 +301,27 @@ bot.start(async (ctx) => {
 });
 
 // media guard
-['photo','document','video','audio','sticker','voice'].forEach((t) =>
+['photo', 'document', 'video', 'audio', 'sticker', 'voice'].forEach((t) =>
   bot.on(t, (ctx) => ctx.reply('This bot only accepts text token addresses.'))
 );
 
 // static buttons
-bot.action('cmd:rules', async (ctx) => (await ctx.answerCbQuery(), ctx.reply(
-  '📜 <b>Rules</b>\n\n' +
-  '• One call per user in 24h (admins are exempt).\n' +
-  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
-  '• We track PnLs & post milestone alerts.\n' +
-  '• Best performers climb the leaderboard.', { parse_mode:'HTML' })));
+bot.action(
+  'cmd:rules',
+  async (ctx) => (
+    await ctx.answerCbQuery(),
+    ctx.reply(
+      '📜 <b>Rules</b>\n\n' +
+        '• One call per user in 24h (admins are exempt).\n' +
+        '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
+        '• We track PnLs & post milestone alerts.\n' +
+        '• Best performers climb the leaderboard.',
+      { parse_mode: 'HTML' }
+    )
+  )
+);
 
-['community','boost','boosted'].forEach(name =>
+['community', 'boost', 'boosted'].forEach((name) =>
   bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)))
 );
 
@@ -234,38 +330,45 @@ function promptMakeCall(ctx) {
   awaitingCA.add(String(ctx.from.id));
   return ctx.reply(
     'Paste the token address now:\n' +
-    '• SOL: is accepted\n' +
-    '• BSC: is accepted 🆕🆕',
+      '• SOL: is accepted\n' +
+      '• BSC: is accepted 🆕🆕',
     { parse_mode: 'HTML' }
   );
 }
 bot.action('cmd:make', async (ctx) => (await ctx.answerCbQuery(), promptMakeCall(ctx)));
 bot.command('make', promptMakeCall);
-bot.command('rules', (ctx) => ctx.reply(
-  '📜 <b>Rules</b>\n\n' +
-  '• One call per user in 24h (admins are exempt).\n' +
-  '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
-  '• We track PnLs & post milestone alerts.\n' +
-  '• Best performers climb the leaderboard.', { parse_mode:'HTML' }));
-bot.command('help', (ctx) => ctx.reply(
-  'Commands:\n' +
-  '/start – open menu\n' +
-  '/make – make a call\n' +
-  '/leaders – top callers\n' +
-  '/leaders_all – top callers (admins included)\n' +
-  '/mycalls – list your last 10 calls\n' +
-  '/rules – rules\n' +
-  '/subscribe – premium info\n' +
-  '/ping – check bot', { parse_mode:'HTML' }));
+bot.command('rules', (ctx) =>
+  ctx.reply(
+    '📜 <b>Rules</b>\n\n' +
+      '• One call per user in 24h (admins are exempt).\n' +
+      '• Paste a SOL mint (32–44 chars) or BSC 0x address.\n' +
+      '• We track PnLs & post milestone alerts.\n' +
+      '• Best performers climb the leaderboard.',
+    { parse_mode: 'HTML' }
+  )
+);
+bot.command('help', (ctx) =>
+  ctx.reply(
+    'Commands:\n' +
+      '/start – open menu\n' +
+      '/make – make a call\n' +
+      '/leaders – top callers\n' +
+      '/leaders_all – top callers (admins included)\n' +
+      '/mycalls – list your last 10 calls\n' +
+      '/rules – rules\n' +
+      '/subscribe – premium info\n' +
+      '/ping – check bot',
+    { parse_mode: 'HTML' }
+  )
+);
 bot.command('ping', (ctx) => ctx.reply('pong ✅'));
 
-// PREMIUM: Subscribe
+// PREMIUM flow (unchanged) ---------------------------------------------------
 bot.action('cmd:subscribe', async (ctx) => {
   await ctx.answerCbQuery();
   return handleSubscribe(ctx);
 });
 bot.command('subscribe', handleSubscribe);
-
 async function handleSubscribe(ctx) {
   if (!PREMIUM_SOL_WALLET) {
     return ctx.reply('Premium is temporarily unavailable. Please try again later.');
@@ -285,28 +388,25 @@ async function handleSubscribe(ctx) {
 
   await ctx.reply(
     '⭐ <b>Premium</b>\n\n' +
-    'Unlock <b>4 calls per day forever</b>.\n' +
-    `Price: <b>${PREMIUM_PRICE_SOL} SOL</b>\n\n` +
-    '1) Tap “Pay … SOL” and complete the transfer in your wallet.\n' +
-    '2) Then tap “Submit Tx Signature” and paste your transaction signature.\n' +
-    'If you can’t find your signature, tap “I Paid ✅” and we’ll review it.',
+      'Unlock <b>4 calls per day forever</b>.\n' +
+      `Price: <b>${PREMIUM_PRICE_SOL} SOL</b>\n\n` +
+      '1) Tap “Pay … SOL” and complete the transfer in your wallet.\n' +
+      '2) Then tap “Submit Tx Signature” and paste your transaction signature.\n' +
+      'If you can’t find your signature, tap “I Paid ✅” and we’ll review it.',
     { parse_mode: 'HTML', ...kb }
   );
 }
-
-// "I Paid" + txsig
 bot.action('premium:paid', async (ctx) => {
   await ctx.answerCbQuery();
   const tgId = String(ctx.from.id);
-
   await PremiumUser.updateOne(
     { tgId },
     { $set: { pending: true }, $setOnInsert: { permanent: false, callsPerDay: 4 } },
     { upsert: true }
   );
-
-  await ctx.reply('Thanks! Payment marked as pending. If you have the tx signature, tap "Submit Tx Signature" to auto-activate.');
-
+  await ctx.reply(
+    'Thanks! Payment marked as pending. If you have the tx signature, tap "Submit Tx Signature" to auto-activate.'
+  );
   if (ADMIN_NOTIFY_ID) {
     await bot.telegram.sendMessage(
       ADMIN_NOTIFY_ID,
@@ -315,49 +415,53 @@ bot.action('premium:paid', async (ctx) => {
     );
   }
 });
-
 bot.action('premium:txsig', async (ctx) => {
   await ctx.answerCbQuery();
   awaitingTxSig.add(String(ctx.from.id));
   await ctx.reply(
     'Please paste your <b>transaction signature</b>.\n' +
-    'Tip: In Phantom → Recent Activity → the transaction → “Copy Signature”.',
+      'Tip: In Phantom → Recent Activity → the transaction → “Copy Signature”.',
     { parse_mode: 'HTML' }
   );
 });
 
-// --- Leaderboard helpers -----------------------------------------------------
-function leaderboardPipeline({ hideAdmins = false } = {}) {
+// --- Leaderboard pipeline (now season-aware) --------------------------------
+function leaderboardPipeline({ hideAdmins = false, seasonStart = null } = {}) {
   const matchStages = [
     { entryMc: { $gt: 0 } },
     { peakMc: { $gt: 0 } },
-    { $or: [{ excludedFromLeaderboard: { $exists: false } }, { excludedFromLeaderboard: { $ne: true } }] },
+    {
+      $or: [
+        { excludedFromLeaderboard: { $exists: false } },
+        { excludedFromLeaderboard: { $ne: true } },
+      ],
+    },
   ];
   if (hideAdmins && ADMIN_IDS.length) {
     matchStages.push({ 'caller.tgId': { $nin: ADMIN_IDS.map(String) } });
   }
+  if (seasonStart instanceof Date) {
+    matchStages.push({ createdAt: { $gte: seasonStart } });
+  }
   return [
     { $match: { $and: matchStages } },
-    { $project: { user: '$caller.username', tgId: '$caller.tgId', x: { $divide: ['$peakMc', '$entryMc'] } } },
+    {
+      $project: {
+        user: '$caller.username',
+        tgId: '$caller.tgId',
+        x: { $divide: ['$peakMc', '$entryMc'] },
+      },
+    },
     { $group: { _id: { user: '$user', tgId: '$tgId' }, sumX: { $sum: '$x' } } },
     { $sort: { sumX: -1 } },
     { $limit: 10 },
   ];
 }
 
-async function getLeaderboard(hideAdmins) {
-  // use cache if not stale & same admin-visibility
-  if (LB_CACHE.rows && Date.now() - LB_CACHE.ts < LB_TTL_MS && LB_CACHE.hideAdmins === hideAdmins) {
-    return LB_CACHE.rows;
-  }
-  return rebuildLeaderboardCache(hideAdmins);
-}
-
-// Leaderboard (button + /leaders)
+// Leaderboard commands --------------------------------------------------------
 bot.action('cmd:leaders', leadersHandler(false));
 bot.command('leaders', leadersHandler(false));
 bot.command('leaders_all', leadersHandler(true));
-
 function leadersHandler(forceAll) {
   return async (ctx) => {
     try {
@@ -366,11 +470,22 @@ function leadersHandler(forceAll) {
       const rows = await getLeaderboard(hideAdmins);
       if (!rows.length) return ctx.reply('No leaderboard data yet — make a call!');
 
-      const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`);
-      const lines = rows.map((r, i) =>
-        `${medal(i)} ${fmtUser(r._id.user, r._id.tgId)} — ${r.sumX.toFixed(2)}× total`
+      const seasonStart = await getSeasonStart();
+      const seasonLine = seasonStart
+        ? ` (Season since ${fmtDate(seasonStart)})`
+        : '';
+
+      const medal = (i) =>
+        i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+      const lines = rows.map(
+        (r, i) =>
+          `${medal(i)} ${fmtUser(r._id.user, r._id.tgId)} — ${r.sumX.toFixed(
+            2
+          )}× total`
       );
-      await ctx.reply('🏆 <b>Top Callers</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
+      await ctx.reply(`🏆 <b>Top Callers</b>${seasonLine}\n` + lines.join('\n'), {
+        parse_mode: 'HTML',
+      });
     } catch (e) {
       console.error(e);
       await ctx.reply('Failed to load leaderboard.');
@@ -390,26 +505,84 @@ bot.command('lbrefresh', async (ctx) => {
   }
 });
 
-// Admin: toggle hide-admins at runtime (persists in memory until restart)
+// Admin: toggle hide-admins at runtime
 bot.command('lbhideadmins', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const arg = (ctx.message.text || '').split(/\s+/)[1]?.toLowerCase();
-  if (!arg || !['on','off'].includes(arg)) {
+  if (!arg || !['on', 'off'].includes(arg)) {
     return ctx.reply('Usage: /lbhideadmins on|off');
   }
-  LEADERBOARD_HIDE_ADMINS = (arg === 'on');
-  LB_CACHE = { rows: null, ts: 0, hideAdmins: LEADERBOARD_HIDE_ADMINS }; // drop cache
-  await ctx.reply(`✅ Hide-admins on /leaders: ${LEADERBOARD_HIDE_ADMINS ? 'ON' : 'OFF'}`);
+  LEADERBOARD_HIDE_ADMINS = arg === 'on';
+  LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
+  await ctx.reply(
+    `✅ Hide-admins on /leaders: ${LEADERBOARD_HIDE_ADMINS ? 'ON' : 'OFF'}`
+  );
 });
 
-// My calls (button + /mycalls)
+// Admin: SEASON controls ------------------------------------------------------
+bot.command('lbseason', async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+
+  const parts = (ctx.message.text || '').trim().split(/\s+/).slice(1);
+  const sub = (parts[0] || '').toLowerCase();
+
+  try {
+    if (sub === 'get' || !sub) {
+      const s = await getSeasonStart();
+      return ctx.reply(
+        s
+          ? `📅 Current season since: <b>${fmtDate(s)}</b>`
+          : '📅 Season: <b>ALL-TIME</b>',
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    if (sub === 'reset') {
+      const now = new Date();
+      await setSeasonStart(now);
+      LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
+      return ctx.reply(
+        `🆕 New season started: <b>${fmtDate(now)}</b> (totals reset)`,
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    if (sub === 'set') {
+      const d = new Date(parts[1]);
+      if (!parts[1] || !Number.isFinite(d.valueOf())) {
+        return ctx.reply('Usage: /lbseason set YYYY-MM-DD');
+      }
+      await setSeasonStart(d);
+      LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
+      return ctx.reply(
+        `✅ Season start set to <b>${fmtDate(d)}</b>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    if (sub === 'clear') {
+      await clearSeasonStart();
+      LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
+      return ctx.reply('🔁 Season cleared — leaderboard is ALL-TIME again.');
+    }
+
+    return ctx.reply('Usage: /lbseason get | reset | set YYYY-MM-DD | clear');
+  } catch (e) {
+    console.error(e);
+    return ctx.reply('Failed to update season.');
+  }
+});
+
+// My calls (button + /mycalls) -----------------------------------------------
 bot.action('cmd:mycalls', myCallsHandler);
 bot.command('mycalls', myCallsHandler);
 async function myCallsHandler(ctx) {
   try {
     if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
-    const list = await Call.find({ 'caller.tgId': tgId }).sort({ createdAt: -1 }).limit(10);
+    const list = await Call.find({ 'caller.tgId': tgId })
+      .sort({ createdAt: -1 })
+      .limit(10);
     if (!list.length) return ctx.reply('You have no calls yet.');
     const lines = list.map((c) => {
       const entry = usd(c.entryMc);
@@ -417,12 +590,16 @@ async function myCallsHandler(ctx) {
       const tkr = c.ticker ? `$${c.ticker}` : '—';
       return `• ${tkr}\n   MC when called: ${entry}\n   MC now: ${now}`;
     });
-    await ctx.reply(`🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`, { parse_mode:'HTML' });
-  } catch (e) { console.error(e); }
+    await ctx.reply(
+      `🧾 <b>Your calls</b> (@${ctx.from.username || tgId})\n\n${lines.join('\n')}`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) {
+    console.error(e);
+  }
 }
 
-// --- Admin tools to fix MEV spikes -----------------------------------------
-// Toggle exclude/include a call (by channel link or CA)
+// --- Admin MEV/curation tools (same as before) -------------------------------
 bot.command('exclude', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
@@ -443,7 +620,6 @@ bot.command('include', async (ctx) => {
   await ctx.reply(`✅ Included ${res.modifiedCount} call(s) back in leaderboard.`);
 });
 
-// Cap a call’s contribution to X (e.g., clamp at 200×)
 bot.command('capx', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const parts = (ctx.message.text || '').split(' ').slice(1);
@@ -465,7 +641,7 @@ bot.command('capx', async (ctx) => {
     if (newPeak !== c.peakMc) {
       c.peakMc = newPeak;
       if (c.lastMc > newPeak) c.lastMc = newPeak;
-      c.peakLocked = true; // 🔒 prevent worker from re-inflating
+      c.peakLocked = true;
       await c.save();
       changed++;
     }
@@ -473,7 +649,6 @@ bot.command('capx', async (ctx) => {
   await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×. (peaks locked)`);
 });
 
-// NEW: Set a user's TOTAL X to a target by trimming biggest calls first
 bot.command('settotalx', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const parts = (ctx.message.text || '').split(' ').slice(1);
@@ -489,16 +664,15 @@ bot.command('settotalx', async (ctx) => {
   const docs = await Call.find({ ...q, entryMc: { $gt: 0 }, peakMc: { $gt: 0 } }).exec();
   if (!docs.length) return ctx.reply('No calls found for that user.');
 
-  // Build rows sorted by contribution (largest first)
-  const rows = docs.map(d => ({ _id: d._id, entry: d.entryMc, peak: d.peakMc, x: d.peakMc / d.entryMc }))
-                   .sort((a,b)=> b.x - a.x);
+  const rows = docs
+    .map((d) => ({ _id: d._id, entry: d.entryMc, peak: d.peakMc, x: d.peakMc / d.entryMc }))
+    .sort((a, b) => b.x - a.x);
 
-  let current = rows.reduce((s,r)=> s + r.x, 0);
+  let current = rows.reduce((s, r) => s + r.x, 0);
   if (current <= target + 1e-9) {
     return ctx.reply(`User is already at ${current.toFixed(2)}× ≤ target ${target}×.`);
   }
 
-  // Reduce biggest contributions first; don't push any call below 1×
   for (const r of rows) {
     if (current <= target) break;
     const maxReduce = Math.max(0, r.x - 1);
@@ -510,25 +684,25 @@ bot.command('settotalx', async (ctx) => {
     current -= delta;
   }
 
-  // Persist only decreases to peak/last
   let changed = 0;
   for (const r of rows) {
-    const doc = docs.find(d => String(d._id) === String(r._id));
+    const doc = docs.find((d) => String(d._id) === String(r._id));
     if (!doc) continue;
     const newPeak = Math.min(doc.peakMc, r.peak);
     if (newPeak < doc.peakMc - 1e-9) {
       doc.peakMc = newPeak;
       if (doc.lastMc > newPeak) doc.lastMc = newPeak;
-      doc.peakLocked = true; // 🔒 lock after trimming
+      doc.peakLocked = true;
       await doc.save();
       changed++;
     }
   }
 
-  await ctx.reply(`✅ Set total X for ${who} to ≈ ${current.toFixed(2)}× (updated ${changed} call(s), peaks locked).`);
+  await ctx.reply(
+    `✅ Set total X for ${who} to ≈ ${current.toFixed(2)}× (updated ${changed} call(s), peaks locked).`
+  );
 });
 
-// OPTIONAL: unlock peaks (if you want the worker to resume updating peaks)
 bot.command('unlockpeak', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
@@ -539,7 +713,7 @@ bot.command('unlockpeak', async (ctx) => {
   await ctx.reply(`🔓 Unlocked peaks on ${res.modifiedCount} call(s).`);
 });
 
-// Text intake (tx sig OR call)
+// Token intake & posting (unchanged except for dup message format) -----------
 bot.on('text', async (ctx) => {
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
@@ -576,11 +750,11 @@ bot.on('text', async (ctx) => {
     if (awaitingCA.has(tgId)) {
       return ctx.reply(
         'That doesn’t look like a valid address.\n' +
-        'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
+          'Examples:\n• SOL: <code>6Vx…R1f</code> or <code>6Vx…R1fpump</code>\n• BSC: <code>0xAbC…123</code>',
         { parse_mode: 'HTML' }
       );
     }
-    return; // ignore non-address messages
+    return;
   }
 
   awaitingCA.delete(tgId);
@@ -602,8 +776,11 @@ bot.on('text', async (ctx) => {
 
   // token info
   let info;
-  try { info = await getTokenInfo(caOrMint); }
-  catch (e) { console.error('price fetch failed:', e.message); }
+  try {
+    info = await getTokenInfo(caOrMint);
+  } catch (e) {
+    console.error('price fetch failed:', e.message);
+  }
   if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
 
   const chainUpper = String(info.chain || '').toUpperCase();
@@ -618,12 +795,20 @@ bot.on('text', async (ctx) => {
     const xNow = existing.entryMc > 0 ? nowMcCapped / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
     await ctx.reply(
-      `⚠️ <b>Token already called</b> by ${fmtUser(existing.caller?.username, existing.caller?.tgId)}.\n\n` +
-      `Called MC: ${usd(existing.entryMc)}\n` +
-      (xNow
-        ? `Now MC: ${usd(nowMcCapped)} — <b>${xNow.toFixed(2)}×</b> since call${hit ? ` (hit <b>${hit}×</b>)` : ''}.`
-        : `Now MC: ${usd(nowMcCapped)}.`),
-      { parse_mode:'HTML', ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}) }
+      `⚠️ <b>Token already called</b> by ${fmtUser(
+        existing.caller?.username,
+        existing.caller?.tgId
+      )}.\n\n` +
+        `Called MC: ${usd(existing.entryMc)}\n` +
+        (xNow
+          ? `Now MC: ${usd(nowMcCapped)} — <b>${xNow.toFixed(2)}×</b> since call${
+              hit ? ` (hit <b>${hit}×</b>)` : ''
+            }.`
+          : `Now MC: ${usd(nowMcCapped)}.`),
+      {
+        parse_mode: 'HTML',
+        ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}),
+      }
     );
     return;
   }
@@ -639,16 +824,18 @@ bot.on('text', async (ctx) => {
       : `https://dexscreener.com/bsc/${encodeURIComponent(caOrMint)}`);
   const tradeUrl = info.tradeUrl || info.pairUrl || info.chartUrl || chartUrl;
 
-  // bonding curve (Pump.fun only) — broaden detection to include “pumpswap” & …pump
+  // bonding curve (Pump.fun only)
   let curveProgress = null;
   const createdOnName = info.dex || info.dexName || 'DEX';
-  const looksPump = chainUpper === 'SOL' && (
-    /\bpump(fun|swap)?\b/i.test(String(createdOnName || '')) ||
-    /\bpump$/i.test(String(caOrMint || '')) ||
-    /\bpump$/i.test(String(raw || ''))
-  );
+  const looksPump =
+    chainUpper === 'SOL' &&
+    (/\bpump(fun|swap)?\b/i.test(String(createdOnName || '')) ||
+      /\bpump$/i.test(String(caOrMint || '')) ||
+      /\bpump$/i.test(String(raw || '')));
   if (looksPump) {
-    try { curveProgress = await fetchPumpfunProgress(caOrMint); } catch {}
+    try {
+      curveProgress = await fetchPumpfunProgress(caOrMint);
+    } catch {}
   }
 
   // bubblemap (EVM only)
@@ -658,24 +845,19 @@ bot.on('text', async (ctx) => {
   const caption = channelCardText({
     user: username,
     totals: { totalCalls, totalX, avgX },
-
     name: info.name,
     tkr: info.ticker || '',
     chain: chainUpper,
     mintOrCa: caOrMint,
-
     stats: { mc: info.mc, lp: info.lp, vol24h: info.vol24h },
-
     createdOnName,
     createdOnUrl: tradeUrl,
     dexPaid: info.dexPaid,
-
-    curveProgress,                 // ← bonding curve %
+    curveProgress,
     bubblemapUrl,
     burnPct: info.liquidityBurnedPct,
     freezeAuth: info.freezeAuthority,
     mintAuth: info.mintAuthority,
-
     twitterUrl: info.twitter,
     botUsername: BOT_USERNAME,
   });
@@ -686,12 +868,16 @@ bot.on('text', async (ctx) => {
     const kb = tradeKeyboards(chainUpper, chartUrl);
     if (WANT_IMAGE && info.imageUrl) {
       const res = await ctx.telegram.sendPhoto(CH_ID, info.imageUrl, {
-        caption, parse_mode: 'HTML', ...kb,
+        caption,
+        parse_mode: 'HTML',
+        ...kb,
       });
       messageId = res?.message_id;
     } else {
       const res = await ctx.telegram.sendMessage(CH_ID, caption, {
-        parse_mode: 'HTML', disable_web_page_preview: false, ...kb,
+        parse_mode: 'HTML',
+        disable_web_page_preview: false,
+        ...kb,
       });
       messageId = res?.message_id;
     }
@@ -707,7 +893,7 @@ bot.on('text', async (ctx) => {
     entryMc: info.mc || 0,
     peakMc: info.mc || 0,
     lastMc: info.mc || 0,
-    peakLocked: false, // explicit
+    peakLocked: false,
     multipliersHit: [],
     postedMessageId: messageId || undefined,
     caller: { tgId, username },
@@ -722,10 +908,12 @@ bot.on('text', async (ctx) => {
   );
 
   // touch leaderboard cache (best-effort)
-  try { await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS); } catch {}
+  try {
+    await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS);
+  } catch {}
 });
 
-// errors & launch
+// errors & launch -------------------------------------------------------------
 bot.catch((err, ctx) => {
   console.error('Unhandled error while processing', ctx.update, err);
 });
