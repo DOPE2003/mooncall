@@ -6,6 +6,7 @@ const mongoose = require('mongoose');
 const { Telegraf, Markup } = require('telegraf');
 const Call = require('./model/call.model');
 const PremiumUser = require('./model/premium.model');
+const Boost = require('./model/boost.model');
 const { getTokenInfo, usd } = require('./lib/price');
 const { channelCardText, tradeKeyboards } = require('./card');
 
@@ -65,6 +66,13 @@ const PREMIUM_SOL_WALLET = (process.env.PREMIUM_SOL_WALLET || '').trim();
 const PREMIUM_PRICE_SOL = Number(process.env.PREMIUM_PRICE_SOL || 0.1);
 const ADMIN_NOTIFY_ID = (process.env.ADMIN_NOTIFY_ID || '').trim();
 
+// BOOST config
+const BOOST_SOL_WALLET =
+  (process.env.BOOST_SOL_WALLET || PREMIUM_SOL_WALLET || '').trim();
+const BOOST_PRICE_SOL = Number(process.env.BOOST_PRICE_SOL || 1);
+const BOOST_POSTS = Number(process.env.BOOST_POSTS || 24);
+const BOOST_INTERVAL_MIN = Number(process.env.BOOST_INTERVAL_MIN || 60);
+
 // for duplicate summary only
 const MILESTONES = String(process.env.MILESTONES || '2,3,4,5,6,7,8')
   .split(',')
@@ -76,8 +84,12 @@ const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
 const SOON = '🚧 Available soon.';
 
 // simple state flags
-const awaitingCA = new Set();
-const awaitingTxSig = new Set();
+const awaitingCA = new Set(); // for /make
+const awaitingTxSig = new Set(); // for premium
+
+// boost flow state
+const awaitingBoostCA = new Map(); // tgId -> { isAdmin: boolean }
+const awaitingBoostTxSig = new Map(); // tgId -> boostId
 
 // --- leaderboard cache (season-aware) ---------------------------------------
 const LB_TTL_MS = 60_000; // 1 minute
@@ -299,7 +311,7 @@ bot.start(async (ctx) => {
       `Moon Call bot 👉: ${botLink}`
   );
 
-  // Winners promo message (added)
+  // Winners promo message
   await ctx.reply(
     'OUR WINNERS PAID 🚀 ✅\n\n' +
       '🥇@squidleader\n' +
@@ -335,9 +347,11 @@ bot.action(
   )
 );
 
-['community', 'boost', 'boosted'].forEach((name) =>
-  bot.action(`cmd:${name}`, async (ctx) => (await ctx.answerCbQuery(), ctx.reply(SOON)))
-);
+// community still "soon"
+bot.action('cmd:community', async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.reply(SOON);
+});
 
 // --- Slash command mirrors ---------------------------------------------------
 function promptMakeCall(ctx) {
@@ -371,13 +385,15 @@ bot.command('help', (ctx) =>
       '/mycalls – list your last 10 calls\n' +
       '/rules – rules\n' +
       '/subscribe – premium info\n' +
+      '/boost – boost a token\n' +
+      '/boosted – list boosted tokens\n' +
       '/ping – check bot',
     { parse_mode: 'HTML' }
   )
 );
 bot.command('ping', (ctx) => ctx.reply('pong ✅'));
 
-// PREMIUM flow (unchanged) ---------------------------------------------------
+// PREMIUM flow ---------------------------------------------------------------
 bot.action('cmd:subscribe', async (ctx) => {
   await ctx.answerCbQuery();
   return handleSubscribe(ctx);
@@ -439,7 +455,74 @@ bot.action('premium:txsig', async (ctx) => {
   );
 });
 
-// --- Leaderboard pipeline (now season-aware) --------------------------------
+// --- BOOST FLOW --------------------------------------------------------------
+async function boostMenuHandler(ctx) {
+  if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
+  const tgId = String(ctx.from.id);
+  const admin = isAdmin(tgId);
+
+  if (!BOOST_SOL_WALLET && !admin) {
+    return ctx.reply('Boost is temporarily unavailable. Please try again later.');
+  }
+
+  awaitingBoostCA.set(tgId, { isAdmin: admin });
+
+  const priceLine = admin
+    ? 'As an admin, your boost is <b>free</b>.'
+    : `Price: <b>${BOOST_PRICE_SOL} SOL</b> for 24h (posted every hour).`;
+
+  return ctx.reply(
+    '🚀 <b>Boost your token</b>\n\n' +
+      'Send the token address you want to boost (SOL mint or BSC 0x CA).\n' +
+      'We will advertise it in the channel every hour for 24 hours.\n\n' +
+      priceLine + '\n\n' +
+      (admin
+        ? 'Paste the CA now.'
+        : 'After you send the CA we will give you a payment link and ask for the transaction signature.'),
+    { parse_mode: 'HTML' }
+  );
+}
+
+async function boostedListHandler(ctx) {
+  if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
+  const now = new Date();
+
+  const boosts = await Boost.find({
+    status: 'active',
+    expiresAt: { $gt: now },
+    postsRemaining: { $gt: 0 },
+  })
+    .sort({ expiresAt: 1 })
+    .limit(20)
+    .lean();
+
+  if (!boosts.length) {
+    return ctx.reply('No tokens are currently boosted.');
+  }
+
+  const lines = boosts.map((b) => {
+    const hoursLeft = Math.max(
+      0,
+      Math.round((b.expiresAt - now) / (60 * 60 * 1000))
+    );
+    const shortCa =
+      b.ca.length > 12 ? `${b.ca.slice(0, 4)}…${b.ca.slice(-4)}` : b.ca;
+    const byUser = fmtUser(b.requester?.username, b.requester?.tgId);
+    return `• ${b.chain} ${shortCa} — ${hoursLeft}h left (by ${byUser})`;
+  });
+
+  return ctx.reply('⚡ <b>Boosted tokens</b>\n\n' + lines.join('\n'), {
+    parse_mode: 'HTML',
+  });
+}
+
+bot.action('cmd:boost', boostMenuHandler);
+bot.command('boost', boostMenuHandler);
+
+bot.action('cmd:boosted', boostedListHandler);
+bot.command('boosted', boostedListHandler);
+
+// --- Leaderboard pipeline (season-aware) ------------------------------------
 function leaderboardPipeline({ hideAdmins = false, seasonStart = null } = {}) {
   const matchStages = [
     { entryMc: { $gt: 0 } },
@@ -568,10 +651,9 @@ bot.command('lbseason', async (ctx) => {
       }
       await setSeasonStart(d);
       LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
-      return ctx.reply(
-        `✅ Season start set to <b>${fmtDate(d)}</b>`,
-        { parse_mode: 'HTML' }
-      );
+      return ctx.reply(`✅ Season start set to <b>${fmtDate(d)}</b>`, {
+        parse_mode: 'HTML',
+      });
     }
 
     if (sub === 'clear') {
@@ -613,7 +695,7 @@ async function myCallsHandler(ctx) {
   }
 }
 
-// --- Admin MEV/curation tools (same as before) -------------------------------
+// --- Admin MEV/curation tools -----------------------------------------------
 bot.command('exclude', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
@@ -640,7 +722,8 @@ bot.command('capx', async (ctx) => {
   if (parts.length < 2) return ctx.reply('Usage: /capx <t.me link | CA> <xCap>');
   const cap = Number(parts.pop());
   const key = parts.join(' ');
-  if (!Number.isFinite(cap) || cap <= 0) return ctx.reply('Cap must be a positive number (e.g., 200).');
+  if (!Number.isFinite(cap) || cap <= 0)
+    return ctx.reply('Cap must be a positive number (e.g., 200).');
 
   const msgId = parseMsgIdFromLink(key);
   const q = msgId ? { postedMessageId: msgId } : { ca: key.trim() };
@@ -666,25 +749,40 @@ bot.command('capx', async (ctx) => {
 bot.command('settotalx', async (ctx) => {
   if (!isAdminUser(ctx)) return;
   const parts = (ctx.message.text || '').split(' ').slice(1);
-  if (parts.length < 2) return ctx.reply('Usage: /settotalx <@username | tgId> <targetX>');
+  if (parts.length < 2)
+    return ctx.reply('Usage: /settotalx <@username | tgId> <targetX>');
 
   const target = Number(parts.pop());
   const who = parts.join(' ').trim();
-  if (!Number.isFinite(target) || target <= 0) return ctx.reply('targetX must be a positive number.');
+  if (!Number.isFinite(target) || target <= 0)
+    return ctx.reply('targetX must be a positive number.');
 
   const username = who.startsWith('@') ? who.slice(1) : null;
-  const q = username ? { 'caller.username': username } : { 'caller.tgId': String(who) };
+  const q = username
+    ? { 'caller.username': username }
+    : { 'caller.tgId': String(who) };
 
-  const docs = await Call.find({ ...q, entryMc: { $gt: 0 }, peakMc: { $gt: 0 } }).exec();
+  const docs = await Call.find({
+    ...q,
+    entryMc: { $gt: 0 },
+    peakMc: { $gt: 0 },
+  }).exec();
   if (!docs.length) return ctx.reply('No calls found for that user.');
 
   const rows = docs
-    .map((d) => ({ _id: d._id, entry: d.entryMc, peak: d.peakMc, x: d.peakMc / d.entryMc }))
+    .map((d) => ({
+      _id: d._id,
+      entry: d.entryMc,
+      peak: d.peakMc,
+      x: d.peakMc / d.entryMc,
+    }))
     .sort((a, b) => b.x - a.x);
 
   let current = rows.reduce((s, r) => s + r.x, 0);
   if (current <= target + 1e-9) {
-    return ctx.reply(`User is already at ${current.toFixed(2)}× ≤ target ${target}×.`);
+    return ctx.reply(
+      `User is already at ${current.toFixed(2)}× ≤ target ${target}×.`
+    );
   }
 
   for (const r of rows) {
@@ -713,7 +811,9 @@ bot.command('settotalx', async (ctx) => {
   }
 
   await ctx.reply(
-    `✅ Set total X for ${who} to ≈ ${current.toFixed(2)}× (updated ${changed} call(s), peaks locked).`
+    `✅ Set total X for ${who} to ≈ ${current.toFixed(
+      2
+    )}× (updated ${changed} call(s), peaks locked).`
   );
 });
 
@@ -727,26 +827,127 @@ bot.command('unlockpeak', async (ctx) => {
   await ctx.reply(`🔓 Unlocked peaks on ${res.modifiedCount} call(s).`);
 });
 
-// Token intake & posting (unchanged except for dup message format) -----------
+// --- BOOST helper to create boost from CA -----------------------------------
+async function handleBoostAddress(ctx, { extracted, username, tgId, boostState }) {
+  const caOrMint = extracted.value;
+
+  let info;
+  try {
+    info = await getTokenInfo(caOrMint);
+  } catch (e) {
+    console.error('boost price fetch failed:', e.message);
+  }
+  if (!info) {
+    await ctx.reply(
+      'Could not resolve token info (Dexscreener) for that address. Try another CA/mint.'
+    );
+    return;
+  }
+
+  const chainUpper = String(info.chain || '').toUpperCase();
+  const normCa = normalizeCa(caOrMint, chainUpper);
+  const isAdminFlag = boostState.isAdmin;
+
+  // --- ADMIN: free boost ----------------------------------------------------
+  if (isAdminFlag) {
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await Boost.create({
+      ca: normCa,
+      chain: chainUpper,
+      requester: { tgId, username },
+      paid: true,
+      freeByAdmin: true,
+      status: 'active',
+      postsRemaining: BOOST_POSTS,
+      nextPostAt: new Date(),
+      expiresAt,
+    });
+
+    await ctx.reply(
+      `✅ Admin boost started for <b>${
+        info.ticker || info.name || 'token'
+      }</b>.\n` +
+        `It will be posted every hour for the next 24 hours.`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  // --- Normal user: needs payment ------------------------------------------
+  if (!BOOST_SOL_WALLET || !Number.isFinite(BOOST_PRICE_SOL) || BOOST_PRICE_SOL <= 0) {
+    await ctx.reply('Boost payments are not configured. Please contact an admin.');
+    return;
+  }
+
+  const payUrl = phantomPayLink(
+    BOOST_SOL_WALLET,
+    BOOST_PRICE_SOL,
+    'Mooncall Boost (24h)',
+    `Boost for @${username || tgId} ${info.ticker || chainUpper}`
+  );
+
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  const boost = await Boost.create({
+    ca: normCa,
+    chain: chainUpper,
+    requester: { tgId, username },
+    paid: false,
+    freeByAdmin: false,
+    status: 'await_payment',
+    postsRemaining: BOOST_POSTS,
+    expiresAt,
+  });
+
+  awaitingBoostTxSig.set(tgId, String(boost._id));
+
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.url(`Pay ${BOOST_PRICE_SOL} SOL`, payUrl)],
+  ]);
+
+  await ctx.reply(
+    '🚀 <b>Boost created</b>\n\n' +
+      `Token: <b>${info.ticker || info.name || chainUpper}</b>\n` +
+      `Price: <b>${BOOST_PRICE_SOL} SOL</b>\n\n` +
+      '1) Tap “Pay … SOL” and complete the transfer in your wallet.\n' +
+      '2) Then <b>paste the transaction signature here</b>.\n\n' +
+      'Once we receive the signature, your token will be posted every hour for 24 hours.',
+    { parse_mode: 'HTML', ...kb }
+  );
+}
+
+// Token intake & posting ------------------------------------------------------
 bot.on('text', async (ctx) => {
   const tgId = String(ctx.from.id);
   const username = ctx.from.username || tgId;
   const raw = (ctx.message?.text || '').trim();
 
-  // 1) tx signature path
+  // 1) PREMIUM tx signature path --------------------------------------------
   if (awaitingTxSig.has(tgId)) {
-    const maybeSig = raw.replace(/^https?:\/\/(www\.)?solscan\.io\/tx\//i, '').trim();
+    const maybeSig = raw
+      .replace(/^https?:\/\/(www\.)?solscan\.io\/tx\//i, '')
+      .trim();
     if (!looksLikeSig(maybeSig)) {
-      return ctx.reply('That does not look like a valid Solana signature. Please paste the signature only.');
+      return ctx.reply(
+        'That does not look like a valid Solana signature. Please paste the signature only.'
+      );
     }
     await PremiumUser.updateOne(
       { tgId },
-      { $set: { permanent: true, pending: false, callsPerDay: 4, lastPaymentTx: maybeSig } },
+      {
+        $set: {
+          permanent: true,
+          pending: false,
+          callsPerDay: 4,
+          lastPaymentTx: maybeSig,
+        },
+      },
       { upsert: true }
     );
     awaitingTxSig.delete(tgId);
 
-    await ctx.reply('✅ Premium activated! You can now make 4 calls/day (lifetime).');
+    await ctx.reply(
+      '✅ Premium activated! You can now make 4 calls/day (lifetime).'
+    );
 
     if (ADMIN_NOTIFY_ID) {
       await bot.telegram.sendMessage(
@@ -758,8 +959,69 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 2) token address flow
+  // 1b) BOOST tx signature path ---------------------------------------------
+  const boostId = awaitingBoostTxSig.get(tgId);
+  if (boostId) {
+    const maybeSig = raw
+      .replace(/^https?:\/\/(www\.)?solscan\.io\/tx\//i, '')
+      .trim();
+    if (!looksLikeSig(maybeSig)) {
+      return ctx.reply(
+        'That does not look like a valid Solana signature. Please paste the signature only.'
+      );
+    }
+
+    const boost = await Boost.findById(boostId);
+    if (!boost) {
+      awaitingBoostTxSig.delete(tgId);
+      return ctx.reply('Could not find your pending boost. Please use /boost again.');
+    }
+    if (boost.status !== 'await_payment') {
+      awaitingBoostTxSig.delete(tgId);
+      return ctx.reply('This boost is already processed.');
+    }
+
+    boost.status = 'active';
+    boost.txSig = maybeSig;
+    boost.paid = true;
+    boost.nextPostAt = new Date();
+    await boost.save();
+
+    awaitingBoostTxSig.delete(tgId);
+
+    await ctx.reply(
+      '✅ Boost activated!\nYour token will be posted every hour for the next 24 hours.',
+      { parse_mode: 'HTML' }
+    );
+
+    if (ADMIN_NOTIFY_ID) {
+      await bot.telegram.sendMessage(
+        ADMIN_NOTIFY_ID,
+        `⚡ <b>New paid boost</b>\nUser: @${username} (${tgId})\nToken: ${boost.chain} ${boost.ca}\nTx: <code>${maybeSig}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+    return;
+  }
+
+  // 2) token address / boost / call flow ------------------------------------
   const extracted = extractAddress(raw);
+
+  // 2a) If user is in "awaitingBoostCA" mode -> treat as boost CA
+  const boostState = awaitingBoostCA.get(tgId);
+  if (boostState) {
+    if (!extracted) {
+      return ctx.reply(
+        'That doesn’t look like a valid address.\n' +
+          'Paste a SOL mint (32–44 chars) or BSC 0x address for the token you want to boost.'
+      );
+    }
+    awaitingBoostCA.delete(tgId);
+    await handleBoostAddress(ctx, { extracted, username, tgId, boostState });
+    return;
+  }
+
+  // 2b) normal call flow ----------------------------------------------------
   if (!extracted) {
     if (awaitingCA.has(tgId)) {
       return ctx.reply(
@@ -926,6 +1188,91 @@ bot.on('text', async (ctx) => {
     await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS);
   } catch {}
 });
+
+// --- BOOST SCHEDULER: posts boosted tokens every BOOST_INTERVAL_MIN minutes --
+async function runBoostScheduler() {
+  const now = new Date();
+  try {
+    const boosts = await Boost.find({
+      status: 'active',
+      nextPostAt: { $lte: now },
+      expiresAt: { $gt: now },
+      postsRemaining: { $gt: 0 },
+    })
+      .sort({ nextPostAt: 1 })
+      .limit(10)
+      .lean();
+
+    if (!boosts.length) return;
+
+    for (const b of boosts) {
+      try {
+        let info = null;
+        try {
+          info = await getTokenInfo(b.ca);
+        } catch (e) {
+          console.error('boost: getTokenInfo failed', e.message);
+        }
+
+        const byUser = fmtUser(b.requester?.username, b.requester?.tgId);
+        const baseText =
+          `🚀 <b>Boosted token</b>\n` +
+          `By: ${byUser}\n\n` +
+          `Chain: <b>${b.chain}</b>\n` +
+          `CA: <code>${b.ca}</code>\n\n`;
+
+        let extra = '';
+        if (info) {
+          const mc = usd(info.mc);
+          extra =
+            `${info.ticker ? `Ticker: <b>${info.ticker}</b>\n` : ''}` +
+            `Market Cap: <b>${mc}</b>\n`;
+        }
+
+        const text = baseText + extra;
+
+        const chainUpper = String(b.chain || '').toUpperCase();
+        const chartUrl =
+          info?.chartUrl ||
+          (chainUpper === 'SOL'
+            ? `https://dexscreener.com/solana/${encodeURIComponent(b.ca)}`
+            : `https://dexscreener.com/bsc/${encodeURIComponent(b.ca)}`);
+        const kb = tradeKeyboards(chainUpper, chartUrl);
+
+        await bot.telegram.sendMessage(CH_ID, text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: false,
+          ...kb,
+        });
+
+        const next = new Date(now.getTime() + BOOST_INTERVAL_MIN * 60 * 1000);
+
+        const res = await Boost.findByIdAndUpdate(
+          b._id,
+          {
+            $set: { lastPostAt: now, nextPostAt: next },
+            $inc: { postsRemaining: -1 },
+          },
+          { new: true }
+        ).lean();
+
+        if (!res || res.postsRemaining <= 0 || res.expiresAt <= now) {
+          await Boost.updateOne(
+            { _id: b._id },
+            { $set: { status: 'finished' } }
+          );
+        }
+      } catch (e) {
+        console.error('boost scheduler error for boost', b._id, e);
+      }
+    }
+  } catch (e) {
+    console.error('boost scheduler tick failed', e);
+  }
+}
+
+// run scheduler every minute
+setInterval(runBoostScheduler, 60_000);
 
 // errors & launch -------------------------------------------------------------
 bot.catch((err, ctx) => {
