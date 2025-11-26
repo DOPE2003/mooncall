@@ -16,7 +16,7 @@ const BoostSchema = new mongoose.Schema(
     freeByAdmin: { type: Boolean, default: false },
     txSig: { type: String },
 
-    // Status: 
+    // Status:
     //  - await_payment: user still has to pay / send tx sig
     //  - active: bot is posting every hour
     //  - finished / cancelled: no more posts
@@ -34,7 +34,6 @@ const BoostSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// for the scheduler
 BoostSchema.index({ status: 1, nextPostAt: 1 });
 
 module.exports = mongoose.model('Boost', BoostSchema);

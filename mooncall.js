@@ -310,6 +310,20 @@ bot.start(async (ctx) => {
     `Telegram\nMoon Call 🌕\nThe ultimate call channel ⚡👉:\n${CHANNEL_LINK}\n\n` +
       `Moon Call bot 👉: ${botLink}`
   );
+
+  // Winners promo message
+  await ctx.reply(
+    'OUR WINNERS PAID 🚀 ✅\n\n' +
+      '🥇@squidleader\n' +
+      '🥈@Scryptogiant\n' +
+      '🥉@undefined\n\n' +
+      'The top call makers in MoonCall bot just got their $SOL prizes dropped 🔥\n\n' +
+      'Every call. Every move. Every x counted.\n\n' +
+      'They sent their plays, they earned their way.\n\n' +
+      'So… real question: when do YOU get paid for your calls?\n\n' +
+      'Next round has started already! one call a day, all month. Top of the leaderboard will earn their SOLs again by the end of the month! 🔥\n\n' +
+      'Join and let’s see who’s really built different. ⚡️'
+  );
 });
 
 // media guard
