@@ -907,14 +907,18 @@ bot.on('text', async (ctx) => {
   const username = ctx.from.username || tgId;
   const raw = (ctx.message?.text || '').trim();
 
-  // make sure /boost and /boosted never fall into "invalid address" path
+  // --- short-circuit slash commands so they never hit the CA parser --------
   if (raw.startsWith('/boost')) {
     awaitingCA.delete(tgId);
     awaitingBoostCA.delete(tgId);
     awaitingBoostTxSig.delete(tgId);
     return boostMenuHandler(ctx);
   }
+
   if (raw.startsWith('/boosted')) {
+    awaitingCA.delete(tgId);
+    awaitingBoostCA.delete(tgId);
+    awaitingBoostTxSig.delete(tgId);
     return boostedListHandler(ctx);
   }
 
@@ -1054,18 +1058,25 @@ bot.on('text', async (ctx) => {
   } catch (e) {
     console.error('price fetch failed:', e.message);
   }
-  if (!info) return ctx.reply('Could not resolve token info (Dexscreener). Try another CA/mint.');
+  if (!info) {
+    return ctx.reply(
+      'Could not resolve token info (Dexscreener). Try another CA/mint.'
+    );
+  }
 
   const chainUpper = String(info.chain || '').toUpperCase();
   const normCa = normalizeCa(caOrMint, chainUpper);
 
   // dup check — show *capped* MC/X using saved peak (respects admin trims)
-  const existing = await Call.findOne({ ca: normCa, chain: chainUpper }).sort({ createdAt: -1 });
+  const existing = await Call.findOne({ ca: normCa, chain: chainUpper }).sort({
+    createdAt: -1,
+  });
   if (existing) {
     const live = Number(info.mc) || 0;
     const peak = Number(existing.peakMc) || live;
     const nowMcCapped = Math.min(live, peak);
-    const xNow = existing.entryMc > 0 ? nowMcCapped / existing.entryMc : null;
+    const xNow =
+      existing.entryMc > 0 ? nowMcCapped / existing.entryMc : null;
     const hit = xNow ? highestMilestone(xNow) : null;
     await ctx.reply(
       `⚠️ <b>Token already called</b> by ${fmtUser(
@@ -1074,13 +1085,17 @@ bot.on('text', async (ctx) => {
       )}.\n\n` +
         `Called MC: ${usd(existing.entryMc)}\n` +
         (xNow
-          ? `Now MC: ${usd(nowMcCapped)} — <b>${xNow.toFixed(2)}×</b> since call${
+          ? `Now MC: ${usd(
+              nowMcCapped
+            )} — <b>${xNow.toFixed(2)}×</b> since call${
               hit ? ` (hit <b>${hit}×</b>)` : ''
             }.`
           : `Now MC: ${usd(nowMcCapped)}.`),
       {
         parse_mode: 'HTML',
-        ...(existing.postedMessageId ? viewChannelButton(existing.postedMessageId) : {}),
+        ...(existing.postedMessageId
+          ? viewChannelButton(existing.postedMessageId)
+          : {}),
       }
     );
     return;
@@ -1112,7 +1127,8 @@ bot.on('text', async (ctx) => {
   }
 
   // bubblemap (EVM only)
-  const bubblemapUrl = info.bubblemapUrl || makeBubblemapUrl(chainUpper, normCa);
+  const bubblemapUrl =
+    info.bubblemapUrl || makeBubblemapUrl(chainUpper, normCa);
 
   // caption
   const caption = channelCardText({
@@ -1155,7 +1171,10 @@ bot.on('text', async (ctx) => {
       messageId = res?.message_id;
     }
   } catch (e) {
-    console.error('send to channel failed:', e?.response?.description || e.message);
+    console.error(
+      'send to channel failed:',
+      e?.response?.description || e.message
+    );
   }
 
   // save
