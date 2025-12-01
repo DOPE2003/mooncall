@@ -373,6 +373,7 @@ bot.command('help', (ctx) =>
       '/subscribe – premium info\n' +
       '/boost – boost a token\n' +
       '/boosted – list boosted tokens\n' +
+      '/booststop – stop boosted token (admin)\n' +
       '/ping – check bot',
     { parse_mode: 'HTML' }
   )
@@ -507,6 +508,41 @@ bot.command('boost', boostMenuHandler);
 
 bot.action('cmd:boosted', boostedListHandler);
 bot.command('boosted', boostedListHandler);
+
+// --- Admin: stop/cancel boosted token(s) ------------------------------------
+bot.command('booststop', async (ctx) => {
+  if (!isAdminUser(ctx)) return; // only admins
+
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) {
+    return ctx.reply('Usage: /booststop <CA or mint>');
+  }
+
+  // Try to parse address, otherwise use raw text
+  const extracted = extractAddress(arg);
+  const caKey = extracted ? extracted.value : arg.trim();
+
+  // Match CA case-insensitively (BSC is lowercased in DB)
+  const query = {
+    ca: new RegExp(`^${caKey}$`, 'i'),
+    status: { $in: ['active', 'await_payment'] },
+  };
+
+  const res = await Boost.updateMany(query, {
+    $set: { status: 'cancelled', postsRemaining: 0 },
+  });
+
+  const modified = res.modifiedCount ?? res.nModified ?? 0;
+
+  if (!modified) {
+    return ctx.reply('No active/awaiting boosts found for that CA.');
+  }
+
+  await ctx.reply(
+    `🛑 Stopped ${modified} boost(s) for CA:\n<code>${caKey}</code>`,
+    { parse_mode: 'HTML' }
+  );
+});
 
 // --- Leaderboard pipeline (season-aware) ------------------------------------
 function leaderboardPipeline({ hideAdmins = false, seasonStart = null } = {}) {
