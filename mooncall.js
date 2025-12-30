@@ -374,7 +374,6 @@ bot.command('help', (ctx) =>
       '/boost – boost a token\n' +
       '/boosted – list boosted tokens\n' +
       '/booststop – stop boosted token (admin)\n' +
-      '/settotalx – set total X for user (admin)\n' +
       '/ping – check bot',
     { parse_mode: 'HTML' }
   )
@@ -699,7 +698,7 @@ async function myCallsHandler(ctx) {
   try {
     if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
-    const list = await Call.find({ 'caller.tgId': tgId })
+       const list = await Call.find({ 'caller.tgId': tgId })
       .sort({ createdAt: -1 })
       .limit(10);
     if (!list.length) return ctx.reply('You have no calls yet.');
@@ -769,11 +768,11 @@ bot.command('capx', async (ctx) => {
   await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×. (peaks locked)`);
 });
 
-// NEW: Admin settotalx that can increase OR decrease total X ------------------
+// --- NEW settotalx: full control via rescaling ------------------------------
 bot.command('settotalx', async (ctx) => {
   if (!isAdminUser(ctx)) return;
 
-  const parts = (ctx.message.text || '').trim().split(/\s+/).slice(1);
+  const parts = (ctx.message.text || '').split(' ').slice(1);
   if (parts.length < 2) {
     return ctx.reply('Usage: /settotalx <@username | tgId> <targetX>');
   }
@@ -801,56 +800,45 @@ bot.command('settotalx', async (ctx) => {
   }
 
   // current total X
-  let current = docs.reduce(
-    (sum, d) => sum + d.peakMc / d.entryMc,
-    0
-  );
-
-  if (!current || !Number.isFinite(current)) {
-    return ctx.reply('Current total X could not be calculated.');
+  let current = 0;
+  for (const d of docs) {
+    current += d.peakMc / d.entryMc;
   }
 
-  // scale factor to reach target
-  const factor = target / current;
+  if (!Number.isFinite(current) || current <= 0) {
+    return ctx.reply('Current total X is not valid for this user.');
+  }
+
+  const factor = target / current; // scale all peaks by this factor
 
   let changed = 0;
   let newTotal = 0;
 
   for (const d of docs) {
-    const oldX = d.peakMc / d.entryMc;
-    if (!Number.isFinite(oldX) || oldX <= 0) continue;
-
-    let newX = oldX * factor;
-
-    // Optional: don’t let any single call drop below 1×
-    if (newX < 1) newX = 1;
-
+    const baseX = d.peakMc / d.entryMc;
+    const newX = baseX * factor;
     const newPeak = d.entryMc * newX;
+
     if (!Number.isFinite(newPeak) || newPeak <= 0) continue;
-    if (Math.abs(newPeak - d.peakMc) < 1e-6) {
-      newTotal += oldX;
-      continue;
-    }
 
     d.peakMc = newPeak;
     if (d.lastMc > newPeak) d.lastMc = newPeak;
     d.peakLocked = true;
-
     await d.save();
+
     changed++;
     newTotal += newX;
   }
 
-  if (!changed) {
-    return ctx.reply(
-      `No calls were changed for ${who} (values already matched or could not be adjusted).`
-    );
-  }
+  // refresh leaderboard (best effort)
+  try {
+    await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS);
+  } catch {}
 
   await ctx.reply(
-    `✅ Set total X for ${who} to ≈ ${newTotal.toFixed(
+    `✅ Forced total X for ${who} to ≈ ${newTotal.toFixed(
       2
-    )}× (updated ${changed} call(s), peaks locked).`
+    )}× (target: ${target}×, updated ${changed} call(s), peaks locked).`
   );
 });
 
