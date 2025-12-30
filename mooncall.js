@@ -698,7 +698,7 @@ async function myCallsHandler(ctx) {
   try {
     if (ctx.updateType === 'callback_query') await ctx.answerCbQuery();
     const tgId = String(ctx.from.id);
-       const list = await Call.find({ 'caller.tgId': tgId })
+    const list = await Call.find({ 'caller.tgId': tgId })
       .sort({ createdAt: -1 })
       .limit(10);
     if (!list.length) return ctx.reply('You have no calls yet.');
@@ -768,7 +768,7 @@ bot.command('capx', async (ctx) => {
   await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×. (peaks locked)`);
 });
 
-// --- NEW settotalx: full control via rescaling ------------------------------
+// --- FIXED settotalx: full control + cache reset -----------------------------
 bot.command('settotalx', async (ctx) => {
   if (!isAdminUser(ctx)) return;
 
@@ -799,7 +799,6 @@ bot.command('settotalx', async (ctx) => {
     return ctx.reply('No calls found for that user.');
   }
 
-  // current total X
   let current = 0;
   for (const d of docs) {
     current += d.peakMc / d.entryMc;
@@ -809,7 +808,7 @@ bot.command('settotalx', async (ctx) => {
     return ctx.reply('Current total X is not valid for this user.');
   }
 
-  const factor = target / current; // scale all peaks by this factor
+  const factor = target / current; // scale all X by this factor
 
   let changed = 0;
   let newTotal = 0;
@@ -830,7 +829,10 @@ bot.command('settotalx', async (ctx) => {
     newTotal += newX;
   }
 
-  // refresh leaderboard (best effort)
+  // Invalidate leaderboard cache so /leaders uses new values
+  LB_CACHE = { rows: null, ts: 0, hideAdmins: null, seasonKey: null };
+
+  // Optional: warm cache best-effort
   try {
     await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS);
   } catch {}
