@@ -768,7 +768,7 @@ bot.command('capx', async (ctx) => {
   await ctx.reply(`✅ Capped ${changed} call(s) at ${cap}×. (peaks locked)`);
 });
 
-// --- FIXED settotalx: full control + cache reset -----------------------------
+// --- FIXED settotalx: match leaderboard scope (season + exclusions) ---------
 bot.command('settotalx', async (ctx) => {
   if (!isAdminUser(ctx)) return;
 
@@ -785,20 +785,32 @@ bot.command('settotalx', async (ctx) => {
   }
 
   const username = who.startsWith('@') ? who.slice(1) : null;
-  const q = username
+  const baseUserQuery = username
     ? { 'caller.username': username }
     : { 'caller.tgId': String(who) };
 
-  const docs = await Call.find({
-    ...q,
+  const seasonStart = await getSeasonStart();
+
+  const query = {
+    ...baseUserQuery,
     entryMc: { $gt: 0 },
     peakMc: { $gt: 0 },
-  }).exec();
+    $or: [
+      { excludedFromLeaderboard: { $exists: false } },
+      { excludedFromLeaderboard: { $ne: true } },
+    ],
+    ...(seasonStart instanceof Date ? { createdAt: { $gte: seasonStart } } : {}),
+  };
+
+  const docs = await Call.find(query).exec();
 
   if (!docs.length) {
-    return ctx.reply('No calls found for that user.');
+    return ctx.reply(
+      'No leaderboard-eligible calls found for that user (check season/exclusions).'
+    );
   }
 
+  // current total X in leaderboard scope
   let current = 0;
   for (const d of docs) {
     current += d.peakMc / d.entryMc;
@@ -808,7 +820,7 @@ bot.command('settotalx', async (ctx) => {
     return ctx.reply('Current total X is not valid for this user.');
   }
 
-  const factor = target / current; // scale all X by this factor
+  const factor = target / current; // scale all X in-scope to reach target
 
   let changed = 0;
   let newTotal = 0;
@@ -837,10 +849,13 @@ bot.command('settotalx', async (ctx) => {
     await rebuildLeaderboardCache(LEADERBOARD_HIDE_ADMINS);
   } catch {}
 
+  const seasonLine =
+    seasonStart instanceof Date ? ` (season since ${fmtDate(seasonStart)})` : '';
+
   await ctx.reply(
     `✅ Forced total X for ${who} to ≈ ${newTotal.toFixed(
       2
-    )}× (target: ${target}×, updated ${changed} call(s), peaks locked).`
+    )}×${seasonLine} (target: ${target}×, updated ${changed} call(s), peaks locked).`
   );
 });
 
